@@ -4,7 +4,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Consulta de Acciones - Huizar", page_icon="📊")
+st.set_page_config(page_title="Consulta de Acciones - Gascon", page_icon="📊")
 
 # ======== Config clave desde Secrets ========
 API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
