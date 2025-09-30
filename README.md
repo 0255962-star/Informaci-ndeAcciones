@@ -1,4 +1,4 @@
-# 📊 Consulta de Acciones – MODELO FINANCIERO HUIZAR
+# 📊 Consulta de Acciones – MODELO FINANCIERO GASCON
 
 Mini app en **Streamlit** que consulta datos de una acción con **yfinance** y traduce la descripción al inglés usando **Gemini**.
 
