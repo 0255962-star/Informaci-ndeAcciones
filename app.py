@@ -3,44 +3,36 @@ import streamlit as st
 import yfinance as yf
 import google.generativeai as genai
 
-# Muestra la versión del SDK para verificar que NO es v1beta (debería verse 0.8.x)
+# =========================
+#  Configuración / Diagnóstico
+# =========================
+st.set_page_config(page_title="Consulta de Acciones - Huizar", page_icon="📊", layout="centered")
+
+# Muestra la versión del SDK de Gemini para verificar que tomó el requirements correcto
 st.caption(f"google-generativeai version: {getattr(genai, '__version__', 'unknown')}")
 
+# Lee la API key desde Streamlit Secrets o variable de entorno
 GEMINI_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
 if not GEMINI_API_KEY:
-    st.stop()  # evita seguir si no hay clave
+    st.error("Falta GOOGLE_API_KEY en Secrets. Ve a Settings → Secrets y pega:  GOOGLE_API_KEY = \"TU_CLAVE_AQUI\"")
+    st.stop()
 
+# Configura el SDK
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Lista de preferencia (incluye sufijo -latest y alternativas)
-PREFERRED_MODELS = [
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b-latest",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-pro",
-    "gemini-1.0-pro",     # compatibilidad con claves antiguas
-    "gemini-pro"          # fallback extremo (SDKs viejos)
-]
-
-def pick_supported_model() -> str:
-    # Filtra modelos que soporten generateContent
-    try:
-        models = genai.list_models()
-        supported = {m.name for m in models if "generateContent" in getattr(m, "supported_generation_methods", [])}
-        for m in PREFERRED_MODELS:
-            # Los nombres retornan como "models/xxx"
-            if f"models/{m}" in supported:
-                return m
-    except Exception:
-        pass
-    # Si no se puede listar (p. ej. permisos), intenta por orden
-    return PREFERRED_MODELS[0]
-
-MODEL_ID = pick_supported_model()
+# Usa un modelo seguro para v1beta: texto puro
+MODEL_ID = "gemini-pro"
 st.caption(f"Usando modelo: {MODEL_ID}")
 
+# =========================
+#  Funciones
+# =========================
 def translate_to_spanish(text: str) -> str:
+    """
+    Traduce 'text' al ESPAÑOL con Gemini (modelo gemini-pro).
+    """
+    if not text:
+        return ""
     prompt = (
         "Traduce al español el siguiente texto sobre una empresa. "
         "Usa español claro y natural de negocios. Conserva nombres propios y números. "
@@ -51,33 +43,47 @@ def translate_to_spanish(text: str) -> str:
     resp = model.generate_content(prompt)
     return (getattr(resp, "text", "") or "").strip()
 
-# --------- UI base (lo que ya tenías) ----------
-st.title("📊 Consulta de Acciones - MODELO FINANCIERO HUIZAR")
-stonk = st.text_input("Ingresa el símbolo de la acción", "MSFT")
 
+@st.cache_data(ttl=3600)
+def get_info(symbol: str):
+    """
+    Obtiene info del ticker desde yfinance. Cacheada por 1 hora.
+    """
+    try:
+        return yf.Ticker(symbol).info or {}
+    except Exception:
+        return {}
+
+
+# =========================
+#  UI
+# =========================
+st.title("📊 Consulta de Acciones - MODELO FINANCIERO HUIZAR")
+
+# Entrada del ticker
+stonk = st.text_input("Ingresa el símbolo de la acción", "MSFT").strip().upper()
+
+# Control de estado para limpiar traducción cuando cambie el ticker
 if "last_symbol" not in st.session_state:
     st.session_state.last_symbol = stonk
 if st.session_state.last_symbol != stonk:
     st.session_state.pop("translated_es", None)
     st.session_state.last_symbol = stonk
 
-@st.cache_data(ttl=3600)
-def get_info(symbol: str):
-    try:
-        return yf.Ticker(symbol).info or {}
-    except Exception:
-        return {}
-
+# Carga de información
 info = get_info(stonk)
 
+# Nombre de la empresa
 st.subheader("🏢 Nombre de la empresa")
 st.write(info.get("longName", "N/A"))
 
+# Descripción original (normalmente en inglés en Yahoo Finance)
 summary = info.get("longBusinessSummary", "")
 st.subheader("📝 Descripción del negocio (original / inglés)")
 st.write(summary if summary else "No hay descripción disponible.")
 
 st.write("---")
+# Botón para traducir al español
 if st.button("Traducir a español 🇪🇸", use_container_width=True):
     if not summary:
         st.warning("No hay descripción para traducir.")
@@ -88,6 +94,15 @@ if st.button("Traducir a español 🇪🇸", use_container_width=True):
             except Exception as e:
                 st.error(f"Error al traducir con Gemini: {e}")
 
+# Mostrar traducción si existe
 if st.session_state.get("translated_es"):
     st.subheader("🇪🇸 Descripción del negocio (traducción)")
     st.write(st.session_state.translated_es)
+
+# (Opcional) Diagnóstico de modelos disponibles: descomenta si necesitas depurar
+# try:
+#     names = [m.name for m in genai.list_models()]
+#     with st.expander("Modelos disponibles (debug)"):
+#         st.write(names[:100])
+# except Exception as e:
+#     st.caption(f"No se pudo listar modelos: {e}")
