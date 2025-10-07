@@ -54,22 +54,18 @@ def pick_model_and_base():
             last_err = data
             continue
         models = data.get("models", [])
-        # Construye set con los nombres y soporte a generateContent
         supported = set()
         for m in models:
-            name = m.get("name")              # e.g., "models/gemini-1.5-flash"
+            name = m.get("name")
             methods = m.get("supportedGenerationMethods") or m.get("supported_generation_methods") or []
             if not name:
                 continue
-            # Normalizamos: nos quedamos con la última parte tras "models/"
             short = name.split("/")[-1]
-            if any("generateContent" == x or "generate_content" == x for x in methods):
+            if any(x in ("generateContent", "generate_content") for x in methods):
                 supported.add(short)
-        # Intenta un modelo preferido que esté soportado
         for pref in PREFERRED:
             if pref in supported:
                 return base, pref
-        # Si no hay ninguno preferido, elige el primero soportado
         if supported:
             return base, sorted(supported)[0]
         last_err = "No hay modelos con generateContent en este endpoint."
@@ -97,7 +93,6 @@ def generate_content_rest(base: str, model: str, text: str) -> str:
             err = r.text
         raise RuntimeError(f"{r.status_code} {err}")
     data = r.json()
-    # Extraer texto de la respuesta
     for cand in data.get("candidates", []):
         content = cand.get("content") or {}
         parts = content.get("parts") or []
@@ -125,17 +120,37 @@ def get_info(symbol: str):
     except Exception:
         return {}
 
-# 🔹 NUEVO: historial de precios cacheado para la gráfica
+# 🔧 ACTUALIZADO: historial robusto (history() -> fallback download, aplanar MultiIndex, normalizar 'Date')
 @st.cache_data(ttl=3600)
 def get_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     try:
-        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+        t = yf.Ticker(symbol)
+        df = t.history(period=period, interval=interval, auto_adjust=False)
+        if df is None or df.empty:
+            df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+
         if df is None or df.empty:
             return pd.DataFrame()
-        df = df.reset_index()  # asegurar columna 'Date'
-        # Filtrar columnas relevantes por si faltan
-        cols = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        return df[cols]
+
+        # Aplana MultiIndex si aparece (algunos entornos lo devuelven así)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+        df = df.reset_index()
+
+        # Normaliza nombre de la columna de tiempo
+        if "Date" not in df.columns:
+            if "Datetime" in df.columns:
+                df = df.rename(columns={"Datetime": "Date"})
+            elif "date" in df.columns:
+                df = df.rename(columns={"date": "Date"})
+
+        # Nos quedamos con las columnas clave
+        desired = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        cols = [c for c in desired if c in df.columns]
+        out = df[cols].dropna(subset=[c for c in ["Open", "High", "Low", "Close"] if c in df.columns])
+
+        return out
     except Exception:
         return pd.DataFrame()
 
@@ -176,7 +191,7 @@ if st.session_state.get("translated_es"):
     st.write(st.session_state.translated_es)
 
 # ─────────────────────────────────────────────────────────────
-# 🔹 NUEVO: Gráfica seaborn (OHLC + Volumen) debajo de la traducción
+# 📈 Gráfica seaborn (OHLC + Volumen) debajo de la traducción
 # ─────────────────────────────────────────────────────────────
 st.write("---")
 st.subheader("📈 Historial de precios (Open, High, Low, Close) y Volumen")
@@ -185,14 +200,15 @@ hist = get_history(stonk, period="6mo", interval="1d")
 
 if hist.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(set(hist.columns)):
     st.warning("No se pudo obtener el historial para graficar.")
+    # Ayuda de diagnóstico rápida (muestra columnas si llegaron)
+    if not hist.empty:
+        st.caption(f"Columnas recibidas: {list(hist.columns)}")
 else:
-    # Configurar estilo de seaborn
     sns.set_theme(style="whitegrid")
+    fig, (ax_price, ax_vol) = plt.subplots(
+        nrows=2, ncols=1, figsize=(10, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
+    )
 
-    # Figura con dos filas: precios arriba, volumen abajo (comparten eje X)
-    fig, (ax_price, ax_vol) = plt.subplots(nrows=2, ncols=1, figsize=(10, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
-
-    # Línea de precios (cuatro series)
     sns.lineplot(data=hist, x="Date", y="Open", ax=ax_price, label="Open")
     sns.lineplot(data=hist, x="Date", y="High", ax=ax_price, label="High")
     sns.lineplot(data=hist, x="Date", y="Low", ax=ax_price, label="Low")
@@ -202,7 +218,6 @@ else:
     ax_price.set_ylabel("Precio")
     ax_price.legend(loc="upper left")
 
-    # Volumen
     sns.lineplot(data=hist, x="Date", y="Volume", ax=ax_vol, label="Volume")
     ax_vol.set_title("Volumen diario")
     ax_vol.set_xlabel("Fecha")
@@ -211,4 +226,5 @@ else:
 
     plt.tight_layout()
     st.pyplot(fig)
+
 
