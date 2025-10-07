@@ -4,27 +4,10 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-# 🔹 NUEVO: data/plot
+# 🔹 NUEVO: para la gráfica
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-
-# 🔹 Candlestick (interactivo) + indicadores
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
-# 🔹 TA-Lib (con fallback a pandas-ta)
-try:
-    import talib as ta
-    TA_BACKEND = "talib"
-except Exception:
-    ta = None
-    try:
-        import pandas_ta as pta
-        TA_BACKEND = "pandas-ta"
-    except Exception:
-        pta = None
-        TA_BACKEND = None
 
 st.set_page_config(page_title="Consulta de Acciones - GASCON", page_icon="📊")
 
@@ -137,7 +120,7 @@ def get_info(symbol: str):
     except Exception:
         return {}
 
-# 🔧 Historial robusto (history() -> fallback download, aplanar MultiIndex, normalizar 'Date')
+# 🔧 ACTUALIZADO: historial robusto (history() -> fallback download, aplanar MultiIndex, normalizar 'Date')
 @st.cache_data(ttl=3600)
 def get_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     try:
@@ -149,22 +132,24 @@ def get_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.Da
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # Aplanar MultiIndex si aparece
+        # Aplana MultiIndex si aparece (algunos entornos lo devuelven así)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
         df = df.reset_index()
 
-        # Normalizar columna temporal
+        # Normaliza nombre de la columna de tiempo
         if "Date" not in df.columns:
             if "Datetime" in df.columns:
                 df = df.rename(columns={"Datetime": "Date"})
             elif "date" in df.columns:
                 df = df.rename(columns={"date": "Date"})
 
+        # Nos quedamos con las columnas clave
         desired = ["Date", "Open", "High", "Low", "Close", "Volume"]
         cols = [c for c in desired if c in df.columns]
         out = df[cols].dropna(subset=[c for c in ["Open", "High", "Low", "Close"] if c in df.columns])
+
         return out
     except Exception:
         return pd.DataFrame()
@@ -206,7 +191,7 @@ if st.session_state.get("translated_es"):
     st.write(st.session_state.translated_es)
 
 # ─────────────────────────────────────────────────────────────
-# 📈 Gráfica seaborn (OHLC + Volumen) debajo de la traducción (lo ya agregado antes)
+# 📈 Gráfica seaborn (OHLC + Volumen) debajo de la traducción
 # ─────────────────────────────────────────────────────────────
 st.write("---")
 st.subheader("📈 Historial de precios (Open, High, Low, Close) y Volumen")
@@ -215,6 +200,7 @@ hist = get_history(stonk, period="6mo", interval="1d")
 
 if hist.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(set(hist.columns)):
     st.warning("No se pudo obtener el historial para graficar.")
+    # Ayuda de diagnóstico rápida (muestra columnas si llegaron)
     if not hist.empty:
         st.caption(f"Columnas recibidas: {list(hist.columns)}")
 else:
@@ -222,6 +208,7 @@ else:
     fig, (ax_price, ax_vol) = plt.subplots(
         nrows=2, ncols=1, figsize=(10, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
     )
+
     sns.lineplot(data=hist, x="Date", y="Open", ax=ax_price, label="Open")
     sns.lineplot(data=hist, x="Date", y="High", ax=ax_price, label="High")
     sns.lineplot(data=hist, x="Date", y="Low", ax=ax_price, label="Low")
@@ -230,78 +217,13 @@ else:
     ax_price.set_xlabel("")
     ax_price.set_ylabel("Precio")
     ax_price.legend(loc="upper left")
+
     sns.lineplot(data=hist, x="Date", y="Volume", ax=ax_vol, label="Volume")
     ax_vol.set_title("Volumen diario")
     ax_vol.set_xlabel("Fecha")
     ax_vol.set_ylabel("Volumen")
     ax_vol.legend(loc="upper left")
+
     plt.tight_layout()
     st.pyplot(fig)
-
-# ─────────────────────────────────────────────────────────────
-# 🕯️ NUEVO: Candlestick con Plotly + RSI usando TA-Lib (o pandas-ta si no hay TA-Lib)
-# ─────────────────────────────────────────────────────────────
-st.write("---")
-st.subheader("🕯️ Gráfica de velas (candlestick) + RSI")
-
-if hist.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(set(hist.columns)):
-    st.info("No hay datos suficientes para la gráfica de velas.")
-else:
-    d = hist.dropna().copy()
-
-    # Calcular RSI (TA-Lib preferido, si no, pandas-ta; si nada, sin RSI)
-    rsi = None
-    try:
-        if TA_BACKEND == "talib":
-            rsi = ta.RSI(d["Close"].astype(float), timeperiod=14)
-        elif TA_BACKEND == "pandas-ta":
-            rsi = pta.rsi(d["Close"].astype(float), length=14)
-    except Exception:
-        rsi = None
-
-    # Crear subplots: 3 paneles (velas, volumen, RSI si disponible)
-    rows = 3 if rsi is not None else 2
-    row_heights = [0.6, 0.25, 0.15] if rsi is not None else [0.75, 0.25]
-
-    fig = make_subplots(
-        rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights
-    )
-
-    # Panel 1: Candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=d["Date"], open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="OHLC"
-        ),
-        row=1, col=1
-    )
-
-    # Panel 2: Volumen (barras)
-    fig.add_trace(
-        go.Bar(x=d["Date"], y=d["Volume"], name="Volumen"),
-        row=2, col=1
-    )
-
-    # Panel 3: RSI (si existe)
-    if rsi is not None:
-        fig.add_trace(
-            go.Scatter(x=d["Date"], y=rsi, mode="lines", name="RSI(14)"),
-            row=3, col=1
-        )
-        # Líneas guía RSI
-        fig.add_hline(y=70, line_dash="dash", line_width=1, row=3, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_width=1, row=3, col=1)
-
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_rangeslider_visible=False,
-        showlegend=True,
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Aviso del backend usado para RSI
-    if TA_BACKEND is None:
-        st.caption("RSI no mostrado: instala TA-Lib o pandas-ta para calcular indicadores.")
-    else:
-        st.caption(f"Indicadores calculados con: {TA_BACKEND}")
 
