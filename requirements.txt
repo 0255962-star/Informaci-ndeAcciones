@@ -1,10 +1,7 @@
-streamlit
 yfinance
 pandas
 numpy
-requests
 seaborn
 matplotlib
-plotly
-TA-Lib     
-pandas-ta  
+streamlit
+requests
