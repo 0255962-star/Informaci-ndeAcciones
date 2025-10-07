@@ -4,6 +4,11 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+# 🔹 NUEVO: para la gráfica
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
 st.set_page_config(page_title="Consulta de Acciones - GASCON", page_icon="📊")
 
 API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
@@ -120,6 +125,20 @@ def get_info(symbol: str):
     except Exception:
         return {}
 
+# 🔹 NUEVO: historial de precios cacheado para la gráfica
+@st.cache_data(ttl=3600)
+def get_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    try:
+        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()  # asegurar columna 'Date'
+        # Filtrar columnas relevantes por si faltan
+        cols = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        return df[cols]
+    except Exception:
+        return pd.DataFrame()
+
 # --------- UI ----------
 st.title("📊 Consulta de Acciones - MODELO FINANCIERO HUIZAR")
 
@@ -155,3 +174,41 @@ if st.button("Traducir a español 🇪🇸", use_container_width=True):
 if st.session_state.get("translated_es"):
     st.subheader("🇪🇸 Descripción del negocio (traducción)")
     st.write(st.session_state.translated_es)
+
+# ─────────────────────────────────────────────────────────────
+# 🔹 NUEVO: Gráfica seaborn (OHLC + Volumen) debajo de la traducción
+# ─────────────────────────────────────────────────────────────
+st.write("---")
+st.subheader("📈 Historial de precios (Open, High, Low, Close) y Volumen")
+
+hist = get_history(stonk, period="6mo", interval="1d")
+
+if hist.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(set(hist.columns)):
+    st.warning("No se pudo obtener el historial para graficar.")
+else:
+    # Configurar estilo de seaborn
+    sns.set_theme(style="whitegrid")
+
+    # Figura con dos filas: precios arriba, volumen abajo (comparten eje X)
+    fig, (ax_price, ax_vol) = plt.subplots(nrows=2, ncols=1, figsize=(10, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+
+    # Línea de precios (cuatro series)
+    sns.lineplot(data=hist, x="Date", y="Open", ax=ax_price, label="Open")
+    sns.lineplot(data=hist, x="Date", y="High", ax=ax_price, label="High")
+    sns.lineplot(data=hist, x="Date", y="Low", ax=ax_price, label="Low")
+    sns.lineplot(data=hist, x="Date", y="Close", ax=ax_price, label="Close")
+    ax_price.set_title(f"{stonk} · Precios diarios (últimos 6 meses)")
+    ax_price.set_xlabel("")
+    ax_price.set_ylabel("Precio")
+    ax_price.legend(loc="upper left")
+
+    # Volumen
+    sns.lineplot(data=hist, x="Date", y="Volume", ax=ax_vol, label="Volume")
+    ax_vol.set_title("Volumen diario")
+    ax_vol.set_xlabel("Fecha")
+    ax_vol.set_ylabel("Volumen")
+    ax_vol.legend(loc="upper left")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
