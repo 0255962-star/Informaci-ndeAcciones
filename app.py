@@ -4,25 +4,30 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-# 🔹 NUEVO: para la gráfica
+# 🔹 Data & plotting
 import pandas as pd
-import seaborn as sns
 import matplotlib.pyplot as plt
+import mplfinance as mpf
+from datetime import datetime, date
 
 st.set_page_config(page_title="Consulta de Acciones - GASCON", page_icon="📊")
 
+# =========================
+# 🔐 API KEY (Gemini)
+# =========================
 API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
 if not API_KEY:
     st.error('Falta GOOGLE_API_KEY en Secrets. Pega exactamente:  GOOGLE_API_KEY = "TU_CLAVE_AQUI"')
     st.stop()
 
-# Endpoints a probar (list y generate)
+# =========================
+# 🔧 Gemini endpoints/modelos
+# =========================
 BASES = [
     "https://generativelanguage.googleapis.com/v1",       # preferido
     "https://generativelanguage.googleapis.com/v1beta",   # fallback
 ]
 
-# Preferencias de modelos por calidad/costo; usaremos el primero que exista y soporte generateContent
 PREFERRED = [
     "gemini-1.5-flash-latest",
     "gemini-1.5-flash",
@@ -112,7 +117,9 @@ def translate_to_spanish(text: str) -> str:
     )
     return generate_content_rest(BASE, MODEL, prompt)
 
-# --------- yfinance cache ----------
+# =========================
+# 📦 yfinance cache
+# =========================
 @st.cache_data(ttl=3600)
 def get_info(symbol: str):
     try:
@@ -120,43 +127,91 @@ def get_info(symbol: str):
     except Exception:
         return {}
 
-# 🔧 ACTUALIZADO: historial robusto (history() -> fallback download, aplanar MultiIndex, normalizar 'Date')
+# --- utilidades de rango temporal ---
+def _ytd_dates():
+    today = date.today()
+    start = date(today.year, 1, 1)
+    return pd.Timestamp(start), pd.Timestamp(today)
+
+RANGE_OPTIONS = [
+    "1 semana",
+    "1 mes",
+    "6 meses",
+    "YTD",
+    "1 año",
+    "3 años",
+    "5 años",
+]
+
+# Mapeo a kwargs para yfinance.history / download
+def range_to_query(range_key: str):
+    if range_key == "1 semana":
+        return {"period": "7d", "interval": "1d"}
+    if range_key == "1 mes":
+        return {"period": "1mo", "interval": "1d"}
+    if range_key == "6 meses":
+        return {"period": "6mo", "interval": "1d"}
+    if range_key == "YTD":
+        start, end = _ytd_dates()
+        return {"start": start, "end": end, "interval": "1d"}
+    if range_key == "1 año":
+        return {"period": "1y", "interval": "1d"}
+    if range_key == "3 años":
+        return {"period": "3y", "interval": "1d"}
+    if range_key == "5 años":
+        return {"period": "5y", "interval": "1d"}
+    return {"period": "6mo", "interval": "1d"}  # fallback
+
 @st.cache_data(ttl=3600)
-def get_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+def get_history(symbol: str, range_key: str) -> pd.DataFrame:
+    """Descarga OHLCV y devuelve DataFrame indexado por Fecha (DatetimeIndex)."""
+    q = range_to_query(range_key)
     try:
         t = yf.Ticker(symbol)
-        df = t.history(period=period, interval=interval, auto_adjust=False)
-        if df is None or df.empty:
-            df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+        # Prioriza history(); si falla, usa download
+        if "period" in q:
+            df = t.history(period=q["period"], interval=q["interval"], auto_adjust=False)
+            if df is None or df.empty:
+                df = yf.download(symbol, period=q["period"], interval=q["interval"], auto_adjust=False, progress=False, threads=False)
+        else:
+            df = t.history(start=q["start"], end=q["end"], interval=q["interval"], auto_adjust=False)
+            if df is None or df.empty:
+                df = yf.download(symbol, start=q["start"], end=q["end"], interval=q["interval"], auto_adjust=False, progress=False, threads=False)
 
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # Aplana MultiIndex si aparece (algunos entornos lo devuelven así)
+        # Aplana MultiIndex si aparece
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
-        df = df.reset_index()
+        # Asegura columnas requeridas
+        required = {"Open", "High", "Low", "Close"}
+        if not required.issubset(set(df.columns)):
+            return pd.DataFrame()
 
-        # Normaliza nombre de la columna de tiempo
-        if "Date" not in df.columns:
-            if "Datetime" in df.columns:
-                df = df.rename(columns={"Datetime": "Date"})
-            elif "date" in df.columns:
-                df = df.rename(columns={"date": "Date"})
+        # Normaliza índice a DatetimeIndex y orden cronológico
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "Date" in df.columns:
+                df = df.set_index(pd.to_datetime(df["Date"])).drop(columns=["Date"])
+            else:
+                df.index = pd.to_datetime(df.index)
 
-        # Nos quedamos con las columnas clave
-        desired = ["Date", "Open", "High", "Low", "Close", "Volume"]
-        cols = [c for c in desired if c in df.columns]
-        out = df[cols].dropna(subset=[c for c in ["Open", "High", "Low", "Close"] if c in df.columns])
+        df = df.sort_index()
+        # Solo deja columnas relevantes para velas (y volumen si existe)
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        out = df[keep].dropna(subset=["Open", "High", "Low", "Close"])
 
         return out
     except Exception:
         return pd.DataFrame()
 
-# --------- UI ----------
+# =========================
+# 🖥️ UI
+# =========================
 st.title("📊 Consulta de Acciones - MODELO FINANCIERO HUIZAR")
 
+# Entrada de símbolo
 stonk = st.text_input("Ingresa el símbolo de la acción", "MSFT").strip().upper()
 
 # Reset traducción si cambia símbolo
@@ -166,6 +221,7 @@ if st.session_state.last_symbol != stonk:
     st.session_state.pop("translated_es", None)
     st.session_state.last_symbol = stonk
 
+# Bloque de info básica
 info = get_info(stonk)
 
 st.subheader("🏢 Nombre de la empresa")
@@ -190,40 +246,42 @@ if st.session_state.get("translated_es"):
     st.subheader("🇪🇸 Descripción del negocio (traducción)")
     st.write(st.session_state.translated_es)
 
-# ─────────────────────────────────────────────────────────────
-# 📈 Gráfica seaborn (OHLC + Volumen) debajo de la traducción
-# ─────────────────────────────────────────────────────────────
+# =========================
+# 📈 Gráfica de velas (Candlestick)
+# =========================
 st.write("---")
-st.subheader("📈 Historial de precios (Open, High, Low, Close) y Volumen")
+st.subheader("📈 Gráfica de Velas (OHLC)")
 
-hist = get_history(stonk, period="6mo", interval="1d")
+# Selector de rango temporal
+default_range = "6 meses"
+range_key = st.selectbox(
+    "Rango de tiempo",
+    RANGE_OPTIONS,
+    index=RANGE_OPTIONS.index(default_range),
+    help="Selecciona el periodo para la gráfica de velas. La vista se actualiza al instante."
+)
 
-if hist.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(set(hist.columns)):
+hist = get_history(stonk, range_key)
+
+if hist.empty:
     st.warning("No se pudo obtener el historial para graficar.")
-    # Ayuda de diagnóstico rápida (muestra columnas si llegaron)
-    if not hist.empty:
-        st.caption(f"Columnas recibidas: {list(hist.columns)}")
 else:
-    sns.set_theme(style="whitegrid")
-    fig, (ax_price, ax_vol) = plt.subplots(
-        nrows=2, ncols=1, figsize=(10, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
+    # Configuración de estilo para mplfinance
+    kwargs = dict(
+        type='candle',
+        style='yahoo',  # paleta legible
+        volume=True if "Volume" in hist.columns else False,
+        title=f"{stonk} · {range_key} (Velas)",
+        ylabel="Precio",
+        ylabel_lower="Volumen" if "Volume" in hist.columns else "",
+        tight_layout=True,
+        figratio=(16, 9),
+        figscale=1.1
     )
 
-    sns.lineplot(data=hist, x="Date", y="Open", ax=ax_price, label="Open")
-    sns.lineplot(data=hist, x="Date", y="High", ax=ax_price, label="High")
-    sns.lineplot(data=hist, x="Date", y="Low", ax=ax_price, label="Low")
-    sns.lineplot(data=hist, x="Date", y="Close", ax=ax_price, label="Close")
-    ax_price.set_title(f"{stonk} · Precios diarios (últimos 6 meses)")
-    ax_price.set_xlabel("")
-    ax_price.set_ylabel("Precio")
-    ax_price.legend(loc="upper left")
-
-    sns.lineplot(data=hist, x="Date", y="Volume", ax=ax_vol, label="Volume")
-    ax_vol.set_title("Volumen diario")
-    ax_vol.set_xlabel("Fecha")
-    ax_vol.set_ylabel("Volumen")
-    ax_vol.legend(loc="upper left")
-
-    plt.tight_layout()
+    # Render en Matplotlib Figure y mostrar en Streamlit
+    fig, axlist = mpf.plot(hist, returnfig=True, **kwargs)
     st.pyplot(fig)
+    plt.close(fig)
+
 
