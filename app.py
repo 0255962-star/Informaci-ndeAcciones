@@ -4,11 +4,12 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-# 🔹 Data & plotting
+# 📦 Data & plotting
 import pandas as pd
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-from datetime import datetime, date
+from datetime import date
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Consulta de Acciones - GASCON", page_icon="📊")
 
@@ -127,7 +128,6 @@ def get_info(symbol: str):
     except Exception:
         return {}
 
-# --- utilidades de rango temporal ---
 def _ytd_dates():
     today = date.today()
     start = date(today.year, 1, 1)
@@ -143,7 +143,6 @@ RANGE_OPTIONS = [
     "5 años",
 ]
 
-# Mapeo a kwargs para yfinance.history / download
 def range_to_query(range_key: str):
     if range_key == "1 semana":
         return {"period": "7d", "interval": "1d"}
@@ -160,15 +159,14 @@ def range_to_query(range_key: str):
         return {"period": "3y", "interval": "1d"}
     if range_key == "5 años":
         return {"period": "5y", "interval": "1d"}
-    return {"period": "6mo", "interval": "1d"}  # fallback
+    return {"period": "6mo", "interval": "1d"}  # fallback seguro
 
 @st.cache_data(ttl=3600)
 def get_history(symbol: str, range_key: str) -> pd.DataFrame:
-    """Descarga OHLCV y devuelve DataFrame indexado por Fecha (DatetimeIndex)."""
+    """Descarga OHLCV y devuelve DataFrame con índice DatetimeIndex."""
     q = range_to_query(range_key)
     try:
         t = yf.Ticker(symbol)
-        # Prioriza history(); si falla, usa download
         if "period" in q:
             df = t.history(period=q["period"], interval=q["interval"], auto_adjust=False)
             if df is None or df.empty:
@@ -185,23 +183,17 @@ def get_history(symbol: str, range_key: str) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
-        # Asegura columnas requeridas
-        required = {"Open", "High", "Low", "Close"}
-        if not required.issubset(set(df.columns)):
-            return pd.DataFrame()
-
-        # Normaliza índice a DatetimeIndex y orden cronológico
+        # Normaliza índice
         if not isinstance(df.index, pd.DatetimeIndex):
             if "Date" in df.columns:
                 df = df.set_index(pd.to_datetime(df["Date"])).drop(columns=["Date"])
             else:
                 df.index = pd.to_datetime(df.index)
 
+        # Orden y columnas clave
         df = df.sort_index()
-        # Solo deja columnas relevantes para velas (y volumen si existe)
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
         out = df[keep].dropna(subset=["Open", "High", "Low", "Close"])
-
         return out
     except Exception:
         return pd.DataFrame()
@@ -247,12 +239,12 @@ if st.session_state.get("translated_es"):
     st.write(st.session_state.translated_es)
 
 # =========================
-# 📈 Gráfica de velas (Candlestick)
+# 📈 Gráfica de Velas (Plotly) + Volumen
 # =========================
 st.write("---")
-st.subheader("📈 Gráfica de Velas (OHLC)")
+st.subheader("📈 Gráfica de Velas (OHLC) con Volumen")
 
-# Selector de rango temporal
+# Selector de rango temporal (actualiza automáticamente al cambiar)
 default_range = "6 meses"
 range_key = st.selectbox(
     "Rango de tiempo",
@@ -266,22 +258,71 @@ hist = get_history(stonk, range_key)
 if hist.empty:
     st.warning("No se pudo obtener el historial para graficar.")
 else:
-    # Configuración de estilo para mplfinance
-    kwargs = dict(
-        type='candle',
-        style='yahoo',  # paleta legible
-        volume=True if "Volume" in hist.columns else False,
-        title=f"{stonk} · {range_key} (Velas)",
-        ylabel="Precio",
-        ylabel_lower="Volumen" if "Volume" in hist.columns else "",
-        tight_layout=True,
-        figratio=(16, 9),
-        figscale=1.1
+    # Crear figura con eje secundario para volumen
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.75, 0.25]
     )
 
-    # Render en Matplotlib Figure y mostrar en Streamlit
-    fig, axlist = mpf.plot(hist, returnfig=True, **kwargs)
-    st.pyplot(fig)
-    plt.close(fig)
+    # Velas
+    fig.add_trace(
+        go.Candlestick(
+            x=hist.index,
+            open=hist["Open"],
+            high=hist["High"],
+            low=hist["Low"],
+            close=hist["Close"],
+            name="OHLC"
+        ),
+        row=1, col=1
+    )
+
+    # Volumen
+    if "Volume" in hist.columns:
+        fig.add_trace(
+            go.Bar(
+                x=hist.index,
+                y=hist["Volume"],
+                name="Volumen",
+                opacity=0.6
+            ),
+            row=2, col=1
+        )
+        fig.update_yaxes(title_text="Volumen", row=2, col=1)
+
+    # Layout: título, sliders, rangeselector
+    fig.update_layout(
+        title=f"{stonk} · {range_key} (Velas)",
+        margin=dict(l=40, r=20, t=60, b=40),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=7, label="1W", step="day", stepmode="backward"),
+                    dict(count=1, label="1M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(step="year", stepmode="todate", label="YTD"),
+                    dict(count=1, label="1Y", step="year", stepmode="backward"),
+                    dict(count=3, label="3Y", step="year", stepmode="backward"),
+                    dict(count=5, label="5Y", step="year", stepmode="backward"),
+                    dict(step="all", label="All")
+                ]
+            ),
+        ),
+        yaxis=dict(title="Precio"),
+        showlegend=False,
+        height=700
+    )
+
+    # Mejoras visuales para velas
+    fig.update_traces(
+        selector=dict(type="candlestick"),
+        increasing_line_color="#16a34a",  # verde
+        decreasing_line_color="#dc2626"   # rojo
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 
