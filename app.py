@@ -4,10 +4,9 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-# 📦 Data & plotting
+# Data & plotting
 import pandas as pd
 from datetime import date
-
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -38,7 +37,6 @@ PREFERRED = [
 ]
 
 def list_models(base: str):
-    """Devuelve (ok, models_json_o_error) del endpoint /models."""
     url = f"{base}/models"
     try:
         r = requests.get(url, params={"key": API_KEY}, timeout=20)
@@ -49,10 +47,6 @@ def list_models(base: str):
         return False, str(e)
 
 def pick_model_and_base():
-    """
-    Intenta /v1 primero: lista modelos y elige uno que soporte generateContent.
-    Si falla, intenta /v1beta. Devuelve (base, model_name).
-    """
     last_err = None
     for base in BASES:
         ok, data = list_models(base)
@@ -77,7 +71,6 @@ def pick_model_and_base():
         last_err = "No hay modelos con generateContent en este endpoint."
     raise RuntimeError(f"No se pudo seleccionar modelo/base. Último error: {last_err}")
 
-# Elegimos base y modelo válidos según tu API key
 try:
     BASE, MODEL = pick_model_and_base()
     st.caption(f"Endpoint seleccionado: {BASE}  ·  Modelo: {MODEL}")
@@ -86,7 +79,6 @@ except Exception as e:
     st.stop()
 
 def generate_content_rest(base: str, model: str, text: str) -> str:
-    """Llama a :generateContent en el base/model dado, devuelve texto plano."""
     url = f"{base}/models/{model}:generateContent"
     payload = {"contents": [{"parts": [{"text": text}]}]}
     headers = {"Content-Type": "application/json"}
@@ -159,7 +151,7 @@ def range_to_query(range_key: str):
         return {"period": "3y", "interval": "1d"}
     if range_key == "5 años":
         return {"period": "5y", "interval": "1d"}
-    return {"period": "6mo", "interval": "1d"}  # fallback seguro
+    return {"period": "6mo", "interval": "1d"}  # fallback
 
 @st.cache_data(ttl=3600)
 def get_history(symbol: str, range_key: str) -> pd.DataFrame:
@@ -179,24 +171,57 @@ def get_history(symbol: str, range_key: str) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # Aplana MultiIndex si aparece
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
-        # Normaliza índice
         if not isinstance(df.index, pd.DatetimeIndex):
             if "Date" in df.columns:
                 df = df.set_index(pd.to_datetime(df["Date"])).drop(columns=["Date"])
             else:
                 df.index = pd.to_datetime(df.index)
 
-        # Orden y columnas clave
         df = df.sort_index()
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
         out = df[keep].dropna(subset=["Open", "High", "Low", "Close"])
         return out
     except Exception:
         return pd.DataFrame()
+
+# ---------- Utilidades de legibilidad ----------
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Re-muestrea a OHLCV con regla pandas (e.g., 'W', 'M') para despejar velas."""
+    if df.empty:
+        return df
+    res = pd.DataFrame()
+    res["Open"] = df["Open"].resample(rule).first()
+    res["High"] = df["High"].resample(rule).max()
+    res["Low"] = df["Low"].resample(rule).min()
+    res["Close"] = df["Close"].resample(rule).last()
+    if "Volume" in df.columns:
+        res["Volume"] = df["Volume"].resample(rule).sum()
+    res = res.dropna(subset=["Open", "High", "Low", "Close"])
+    return res
+
+def density_aware_downsample(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Elige automáticamente W/M si hay demasiados puntos; devuelve (df_res, etiqueta)."""
+    n = len(df)
+    if n > 800:
+        return resample_ohlc(df, "M"), " (mensual)"
+    if n > 300:
+        return resample_ohlc(df, "W"), " (semanal)"
+    return df, ""
+
+def add_moving_averages(df: pd.DataFrame, windows=(20, 50)) -> pd.DataFrame:
+    out = df.copy()
+    for w in windows:
+        out[f"SMA{w}"] = out["Close"].rolling(w).mean()
+    return out
+
+def volume_colors(df: pd.DataFrame):
+    """Colores para volumen según dirección de cierre vs apertura."""
+    up_color = "rgba(22,163,74,0.7)"   # verde
+    down_color = "rgba(220,38,38,0.7)" # rojo
+    return [up_color if c >= o else down_color for o, c in zip(df["Open"], df["Close"])]
 
 # =========================
 # 🖥️ UI
@@ -239,64 +264,118 @@ if st.session_state.get("translated_es"):
     st.write(st.session_state.translated_es)
 
 # =========================
-# 📈 Gráfica de Velas (Plotly) + Volumen
+# 📈 Gráfica de Velas (Plotly) mejorada
 # =========================
 st.write("---")
-st.subheader("📈 Gráfica de Velas (OHLC) con Volumen")
+st.subheader("📈 Velas OHLC con Volumen (alta legibilidad)")
 
-# Selector de rango temporal (actualiza automáticamente al cambiar)
-default_range = "6 meses"
-range_key = st.selectbox(
-    "Rango de tiempo",
-    RANGE_OPTIONS,
-    index=RANGE_OPTIONS.index(default_range),
-    help="Selecciona el periodo para la gráfica de velas. La vista se actualiza al instante."
-)
+# Controles
+col1, col2, col3 = st.columns([1,1,1])
+with col1:
+    default_range = "6 meses"
+    range_key = st.selectbox(
+        "Rango de tiempo",
+        RANGE_OPTIONS,
+        index=RANGE_OPTIONS.index(default_range),
+        help="La vista se actualiza al instante."
+    )
+with col2:
+    auto_downsample = st.toggle("Agrupar automáticamente (W/M) si hay exceso de velas)", value=True)
+with col3:
+    show_sma = st.toggle("Mostrar SMA 20/50", value=True)
 
 hist = get_history(stonk, range_key)
 
 if hist.empty:
     st.warning("No se pudo obtener el historial para graficar.")
 else:
-    # Crear figura con eje secundario para volumen
+    # Downsample automático
+    suffix = ""
+    df_plot = hist.copy()
+    if auto_downsample:
+        df_plot, suffix = density_aware_downsample(df_plot)
+
+    # SMAs
+    if show_sma:
+        df_plot = add_moving_averages(df_plot, windows=(20, 50))
+
+    # Fig con dos filas: velas y volumen
     fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.06,
-        row_heights=[0.75, 0.25]
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.74, 0.26]
     )
 
-    # Velas
+    # Candlestick con alto contraste (relleno y borde)
     fig.add_trace(
         go.Candlestick(
-            x=hist.index,
-            open=hist["Open"],
-            high=hist["High"],
-            low=hist["Low"],
-            close=hist["Close"],
-            name="OHLC"
+            x=df_plot.index,
+            open=df_plot["Open"],
+            high=df_plot["High"],
+            low=df_plot["Low"],
+            close=df_plot["Close"],
+            name="OHLC",
+            increasing_line_color="rgb(16,130,59)",
+            increasing_fillcolor="rgba(16,130,59,0.9)",
+            decreasing_line_color="rgb(200,30,30)",
+            decreasing_fillcolor="rgba(200,30,30,0.9)",
+            line=dict(width=1.25),
+            whiskerwidth=0.3,
+            hovertemplate=(
+                "<b>%{x|%Y-%m-%d}</b><br>" +
+                "Open: %{open:.2f}<br>" +
+                "High: %{high:.2f}<br>" +
+                "Low: %{low:.2f}<br>" +
+                "Close: %{close:.2f}<extra></extra>"
+            )
         ),
         row=1, col=1
     )
 
-    # Volumen
-    if "Volume" in hist.columns:
+    # Medias móviles (si se activan)
+    if show_sma:
+        if "SMA20" in df_plot.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_plot.index, y=df_plot["SMA20"],
+                    mode="lines", name="SMA 20",
+                    line=dict(width=1.5, dash="solid"),
+                    hovertemplate="SMA20: %{y:.2f}<extra></extra>"
+                ),
+                row=1, col=1
+            )
+        if "SMA50" in df_plot.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_plot.index, y=df_plot["SMA50"],
+                    mode="lines", name="SMA 50",
+                    line=dict(width=1.5, dash="dot"),
+                    hovertemplate="SMA50: %{y:.2f}<extra></extra>"
+                ),
+                row=1, col=1
+            )
+
+    # Volumen coloreado por dirección
+    if "Volume" in df_plot.columns:
+        vol_colors = volume_colors(df_plot)
         fig.add_trace(
             go.Bar(
-                x=hist.index,
-                y=hist["Volume"],
-                name="Volumen",
-                opacity=0.6
+                x=df_plot.index, y=df_plot["Volume"],
+                name="Volumen", marker_color=vol_colors,
+                opacity=0.8,
+                hovertemplate="Volumen: %{y:,}<extra></extra>"
             ),
             row=2, col=1
         )
         fig.update_yaxes(title_text="Volumen", row=2, col=1)
 
-    # Layout: título, sliders, rangeselector
+    # Layout y ejes
     fig.update_layout(
-        title=f"{stonk} · {range_key} (Velas)",
-        margin=dict(l=40, r=20, t=60, b=40),
+        title=f"{stonk} · {range_key}{suffix}",
+        template="plotly_white",
+        height=760,
+        margin=dict(l=40, r=25, t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         xaxis=dict(
+            showgrid=True, gridcolor="rgba(0,0,0,0.08)",
             rangeslider=dict(visible=True),
             rangeselector=dict(
                 buttons=[
@@ -311,18 +390,18 @@ else:
                 ]
             ),
         ),
-        yaxis=dict(title="Precio"),
-        showlegend=False,
-        height=700
+        yaxis=dict(
+            title="Precio", showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+            zeroline=False
+        ),
+        dragmode="pan",
     )
 
-    # Mejoras visuales para velas
-    fig.update_traces(
-        selector=dict(type="candlestick"),
-        increasing_line_color="#16a34a",  # verde
-        decreasing_line_color="#dc2626"   # rojo
-    )
+    # Pequeñas mejoras de visibilidad
+    fig.update_xaxes(showline=True, linewidth=1, linecolor="rgba(0,0,0,0.25)")
+    fig.update_yaxes(showline=True, linewidth=1, linecolor="rgba(0,0,0,0.25)")
 
     st.plotly_chart(fig, use_container_width=True)
+
 
 
