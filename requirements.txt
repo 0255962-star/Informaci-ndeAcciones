@@ -1,6 +1,6 @@
-yfinance
-pandas
-numpy
 streamlit
 requests
+pandas
 plotly
+beautifulsoup4
+lxml
