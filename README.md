@@ -1,6 +1,10 @@
 # 📊 Consulta de Acciones – MODELO FINANCIERO GASCON
 
-Mini app en **Streamlit** que consulta datos de una acción con **yfinance** y traduce la descripción al inglés usando **Gemini**.
+Mini app en **Streamlit** que:
+- Consulta datos de una acción con **yfinance**.
+- Traduce la descripción del negocio con **Gemini** (Google AI Studio).
+- Muestra **gráfica de velas (candlestick)** con **OHLC** y **Volumen**.
+- Selector de periodos: **1 semana, 1 mes, 6 meses, YTD, 1 año, 3 años, 5 años**.
 
 ## Requisitos
 - Python 3.10+ recomendado
