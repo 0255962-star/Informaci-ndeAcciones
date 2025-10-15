@@ -1,7 +1,6 @@
 yfinance
 pandas
 numpy
-matplotlib
 streamlit
 requests
-mplfinance
+plotly
