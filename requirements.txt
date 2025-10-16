@@ -1,15 +1,16 @@
 streamlit
+yfinance
 pandas
 numpy
 plotly
 requests
-yfinance
-gspread==6.*
-google-auth==2.*
-google-auth-oauthlib==1.*   # opcional, pero útil
+
+# Google Sheets (parche y compatibilidad)
 gspread==6.0.2
 google-auth==2.33.0
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 httplib2>=0.22.0
-requests>=2.31.0
+
+# Opcional útil
+lxml
