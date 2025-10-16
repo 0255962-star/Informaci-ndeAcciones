@@ -29,6 +29,10 @@ h1,h2,h3 {font-weight:700; letter-spacing:-.2px}
 .stat-value { font-weight:700; font-size:1.1rem }
 .card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:12px; height:92px; }
 .stSidebar { border-right:1px solid #e5e7eb; }
+.badge { display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.9rem; }
+.badge-green { background:#e7f8ec; color:#166534; border:1px solid #bbf7d0; }
+.badge-yellow{ background:#fff7e6; color:#92400e; border:1px solid #fde68a; }
+.badge-red   { background:#fee2e2; color:#7f1d1d; border:1px solid #fecaca; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,6 +45,7 @@ menu = st.sidebar.radio(
     [
         "Consulta de Acciones",
         "Mi Portafolio (Google Sheets)",
+        "Evaluar nueva acción (básico)",   # << NUEVO
         "Riesgo de Inversión",
         "CAPM",
         "Optimización de Portafolio (Markowitz)",
@@ -135,6 +140,12 @@ def compute_beta_alpha(stock_returns: pd.Series, market_returns: pd.Series):
     beta = cov/var_m if var_m != 0 else np.nan
     alpha = merged.iloc[:,0].mean() - beta*merged.iloc[:,1].mean()
     return beta, alpha
+
+def max_drawdown(series: pd.Series):
+    if series.empty: return np.nan
+    cummax = series.cummax()
+    dd = (series / cummax) - 1.0
+    return dd.min()
 
 # =========================================================
 # FORMATEADORES
@@ -508,7 +519,6 @@ elif menu == "Mi Portafolio (Google Sheets)":
                            xaxis_title="", yaxis_title="Crecimiento de $1", height=420)
     st.plotly_chart(fig_perf, use_container_width=True)
 
-    # Contribución al riesgo
     cov_ann = rets.cov() * 252
     if cov_ann.shape[0] == len(weights):
         sigma_p = float(np.sqrt(weights.T @ cov_ann.values @ weights))
@@ -523,14 +533,12 @@ elif menu == "Mi Portafolio (Google Sheets)":
                                  xaxis_title="", yaxis_title="% de riesgo")
             st.plotly_chart(fig_rc, use_container_width=True)
 
-    # Distribución por grupo
     grp = pf.groupby("Grupo", as_index=False)["Weight"].sum().sort_values("Weight", ascending=False)
     if not grp.empty:
         fig_grp = go.Figure(data=[go.Pie(labels=grp["Grupo"], values=grp["Weight"], hole=0.5)])
         fig_grp.update_layout(title="Distribución por grupo", template=TEMPLATE, height=400)
         st.plotly_chart(fig_grp, use_container_width=True)
 
-    # Detalle por activo
     indiv_ann_ret = (1 + rets.mean())**252 - 1
     indiv_ann_vol = rets.std() * np.sqrt(252)
     detail = pd.DataFrame({
@@ -541,6 +549,137 @@ elif menu == "Mi Portafolio (Google Sheets)":
     }).reindex(rets.columns)
     st.subheader("Detalle por activo")
     st.dataframe(detail.style.format({"Weight":"{:.2%}","AnnReturn":"{:.2%}","AnnVol":"{:.2%}"}), use_container_width=True)
+
+# =========================================================
+# SECCIÓN: EVALUAR NUEVA ACCIÓN (BÁSICO)  << NUEVO
+# =========================================================
+elif menu == "Evaluar nueva acción (básico)":
+    st.markdown("<h1>Evaluar nueva acción (básico)</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Compara tu portafolio actual vs. agregar un ticker con peso propuesto.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
+    colA, colB, colC, colD = st.columns([2.1,1.1,1,1])
+    with colA:
+        spreadsheet_target = st.text_input("Spreadsheet (nombre, URL o ID)", value=st.secrets.get("GSHEETS_SPREADSHEET_NAME",""))
+    with colB:
+        worksheet = st.text_input("Worksheet", value=st.secrets.get("GSHEETS_WORKSHEET_NAME","Portafolio"))
+    with colC:
+        range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
+    with colD:
+        rf = st.number_input("Tasa libre de riesgo", value=0.04, step=0.01)
+
+    c1, c2, c3 = st.columns([1.2,1,1])
+    with c1: new_ticker = st.text_input("Ticker candidato", "NFLX").upper().strip()
+    with c2: new_weight = st.slider("Peso propuesto", min_value=0.0, max_value=0.20, value=0.05, step=0.01)
+    with c3: bench = st.selectbox("Benchmark (β)", options=["SPY","^GSPC","QQQ"], index=0)
+
+    # Leer portafolio base
+    df_sheet = read_portfolio_from_sheet(spreadsheet_target, worksheet) if spreadsheet_target else pd.DataFrame()
+    SAMPLE = pd.DataFrame({
+        "Ticker":["SPY","KO","PG","JNJ","PEP","COST","NVDA","GOOG","META","MSFT","AMZN"],
+        "Weight":[0.30,0.08,0.07,0.06,0.05,0.04,0.12,0.09,0.08,0.06,0.05]
+    })
+    if df_sheet.empty or not {"Ticker","Weight"}.issubset(df_sheet.columns):
+        pf = SAMPLE.copy()
+        st.info("Usando portafolio de ejemplo (no se pudo leer tu Sheets).")
+    else:
+        pf = df_sheet[["Ticker","Weight"]].copy()
+        pf["Ticker"] = pf["Ticker"].astype(str).str.upper()
+        pf["Weight"] = pd.to_numeric(pf["Weight"], errors="coerce").fillna(0)
+
+    # Normalizar pesos base
+    s = pf["Weight"].sum()
+    if s <= 0:
+        st.error("Los pesos de la hoja están vacíos o suman 0. Ajusta tu Google Sheets.")
+        st.stop()
+    pf["Weight"] = pf["Weight"] / s
+
+    # Construir pesos "antes" y "después"
+    period, interval = range_to_yf_params(range_key)
+    base_tickers = pf["Ticker"].tolist()
+    tickers_all = sorted(list(set(base_tickers + [new_ticker])))
+    prices = load_prices(tickers_all + [bench], period=period, interval=interval)
+    if prices.empty or prices.shape[0] < 10:
+        st.warning("No hay datos suficientes para el periodo elegido.")
+        st.stop()
+
+    rets = prices.pct_change().dropna()
+    # Portafolio base
+    w_base = pf.set_index("Ticker")["Weight"].reindex(rets.columns, fill_value=0.0).values
+    port_base = rets.dot(w_base)
+
+    # Portafolio con candidato: reescalar base a (1 - new_weight) y agregar candidato
+    w_after = pf.set_index("Ticker")["Weight"].copy()
+    w_after = w_after * (1 - new_weight)
+    w_after = w_after.reindex(rets.columns, fill_value=0.0)
+    if new_ticker in rets.columns:
+        w_after.loc[new_ticker] += new_weight
+    w_after = w_after.values
+    port_after = rets.dot(w_after)
+
+    # Métricas simples
+    def ann_stats(r):
+        mu = (1 + r.mean())**252 - 1
+        sigma = r.std() * np.sqrt(252)
+        sharpe = (mu - rf) / sigma if sigma > 0 else np.nan
+        cum = (1 + r).cumprod()
+        mdd = max_drawdown(cum)
+        return mu, sigma, sharpe, cum, mdd
+
+    mu_b, sig_b, sh_b, cum_b, mdd_b = ann_stats(port_base)
+    mu_a, sig_a, sh_a, cum_a, mdd_a = ann_stats(port_after)
+
+    # Correlación candidato vs. base (si existe el ticker)
+    corr_candidate = np.nan
+    if new_ticker in rets.columns:
+        corr_candidate = np.corrcoef(rets[new_ticker].reindex(port_base.index, fill_value=np.nan).dropna(),
+                                     port_base.reindex(rets.index, fill_value=np.nan).dropna())[0,1]
+
+    # Reglas simples de decisión (semáforo)
+    delta_sharpe = (sh_a - sh_b) if (not np.isnan(sh_a) and not np.isnan(sh_b)) else np.nan
+    delta_mdd = (mdd_a - mdd_b) if (not np.isnan(mdd_a) and not np.isnan(mdd_b)) else np.nan  # más negativo = peor
+
+    decision = "Considerar"
+    badge_class = "badge-yellow"
+    motivo = []
+
+    # Criterios básicos (ajústalos si quieres)
+    cond_verde = (delta_sharpe >= 0.03) and (delta_mdd >= -0.02) and (np.isnan(corr_candidate) or corr_candidate <= 0.75)
+    cond_rojo  = (np.isnan(delta_sharpe) or delta_sharpe <= 0.0)
+
+    if cond_verde:
+        decision = "Agregar"
+        badge_class = "badge-green"
+        motivo.append("Mejora el Sharpe del portafolio y no empeora significativamente el drawdown.")
+        if not np.isnan(corr_candidate) and corr_candidate <= 0.75:
+            motivo.append("Aporta diversificación (correlación moderada/baja).")
+    elif cond_rojo:
+        decision = "No agregar"
+        badge_class = "badge-red"
+        motivo.append("No mejora el Sharpe del portafolio.")
+        if delta_mdd < -0.03:
+            motivo.append("Empeora el drawdown de forma relevante.")
+
+    st.markdown(f'**Recomendación:** <span class="badge {badge_class}">{decision}</span>', unsafe_allow_html=True)
+    with st.expander("Ver resumen"):
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Δ Sharpe", f'{(delta_sharpe if not np.isnan(delta_sharpe) else 0):+.2f}')
+        c2.metric("Δ Volatilidad", f'{(sig_a - sig_b)*100:+.2f}%')
+        c3.metric("Δ Max Drawdown", f'{(mdd_a - mdd_b)*100:+.2f}%')
+        c4.metric("Correlación candidato", f'{corr_candidate:.2f}' if not np.isnan(corr_candidate) else "N/A")
+        if motivo:
+            st.write("- " + "\n- ".join(motivo))
+
+    # Gráfico comparativo simple
+    fig_comp = go.Figure()
+    fig_comp.add_trace(go.Scatter(x=cum_b.index, y=cum_b.values, mode="lines", name="Portafolio (antes)"))
+    fig_comp.add_trace(go.Scatter(x=cum_a.index, y=cum_a.values, mode="lines", name="Portafolio (después)"))
+    if new_ticker in rets.columns:
+        cum_new = (1 + rets[new_ticker]).cumprod()
+        fig_comp.add_trace(go.Scatter(x=cum_new.index, y=cum_new.values, mode="lines", name=new_ticker, line=dict(dash="dot")))
+    fig_comp.update_layout(title="Crecimiento de $1: antes vs. después", template=TEMPLATE,
+                           xaxis_title="", yaxis_title="Crecimiento de $1", height=460)
+    st.plotly_chart(fig_comp, use_container_width=True)
 
 # =========================================================
 # SECCIÓN: RIESGO DE INVERSIÓN
