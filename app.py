@@ -1,4 +1,6 @@
 # App.py — Panel de Finanzas con Google Sheets (Transactions) + Gemini + Plotly
+# Mod: manejo robusto de Google Sheets (no cachear Worksheet, reintentos y botón de reconexión)
+
 import os
 import re
 import json
@@ -306,7 +308,7 @@ def translate_to_spanish(text: str) -> str:
     return generate_content_rest(base, model, prompt)
 
 # =========================================================
-# GOOGLE SHEETS — conexión y utilidades (FIX: gspread.authorize)
+# GOOGLE SHEETS — conexión y utilidades (FIX: no cachear Worksheet)
 # =========================================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -315,9 +317,6 @@ SCOPES = [
 
 @st.cache_resource
 def get_gs_client():
-    """
-    Fix: usa gspread.authorize(creds), que crea internamente la AuthorizedSession.
-    """
     info = st.secrets.get("gcp_service_account", None)
     creds = None
     if info:
@@ -328,31 +327,41 @@ def get_gs_client():
         return None
     return gspread.authorize(creds)
 
-def parse_spreadsheet_target(text: str):
-    if not text: return None, None
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
-    if m: return None, m.group(1)     # URL → ID
-    if re.fullmatch(r"[A-Za-z0-9\-_]{20,}", text):  # ID puro
-        return None, text
-    return text, None                  # nombre
+def open_transactions_ws(force_retry: bool = True):
+    """
+    Abre SIEMPRE un worksheet nuevo (no cachea el handle).
+    Si falla y force_retry=True, limpia el cache del client y reintenta una vez.
+    """
+    def _open():
+        client = get_gs_client()
+        if client is None:
+            return None
+        target = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
+        ws_name = st.secrets.get("GSHEETS_TRANSACTIONS_WS", "Transactions")
+        if not target:
+            return None
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", target)
+        if m:
+            sh = client.open_by_key(m.group(1))
+        elif re.fullmatch(r"[A-Za-z0-9\-_]{20,}", target):
+            sh = client.open_by_key(target)
+        else:
+            sh = client.open(target)
+        return sh.worksheet(ws_name)
 
-@st.cache_data(ttl=120)
-def open_transactions_ws():
-    client = get_gs_client()
-    if client is None: return None
-    target = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
-    ws_name = st.secrets.get("GSHEETS_TRANSACTIONS_WS", "Transactions")
-    if not target: return None
-    title, key = parse_spreadsheet_target(target)
     try:
-        sh = client.open_by_key(key) if key else client.open(title)
-        ws = sh.worksheet(ws_name)
-        return ws
+        return _open()
     except Exception:
+        if force_retry:
+            st.cache_resource.clear()  # invalida el client cacheado
+            try:
+                return _open()
+            except Exception:
+                return None
         return None
 
 def read_transactions_df() -> pd.DataFrame:
-    ws = open_transactions_ws()
+    ws = open_transactions_ws(force_retry=True)
     if ws is None:
         return pd.DataFrame()
     try:
@@ -395,7 +404,7 @@ def read_transactions_df() -> pd.DataFrame:
         return pd.DataFrame()
 
 def append_transaction_row(ticker: str, trade_date: str, shares: float, price: float=None, fees: float=0.0, notes: str=""):
-    ws = open_transactions_ws()
+    ws = open_transactions_ws(force_retry=True)
     if ws is None:
         raise RuntimeError("No se pudo abrir la hoja de transacciones. Verifica secrets y permisos.")
     row = [
@@ -406,15 +415,15 @@ def append_transaction_row(ticker: str, trade_date: str, shares: float, price: f
         0.0 if fees is None or np.isnan(fees) else float(fees),
         notes or ""
     ]
-    headers = ["Ticker","TradeDate","Shares","Price","Fees","Notes"]
     values = ws.get_all_values()
+    headers = ["Ticker","TradeDate","Shares","Price","Fees","Notes"]
     if not values:
         ws.update([headers, row])
     else:
         ws.append_row(row, value_input_option="USER_ENTERED")
 
 def overwrite_transactions_df(df: pd.DataFrame):
-    ws = open_transactions_ws()
+    ws = open_transactions_ws(force_retry=True)
     if ws is None:
         raise RuntimeError("No se pudo abrir la hoja de transacciones.")
     out = df.copy()
@@ -543,6 +552,12 @@ elif menu == "Mi Portafolio (Google Sheets)":
     st.markdown("<h1>Mi Portafolio</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Lectura de transacciones, cálculo de pesos por valor de mercado, altas y bajas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
+    # Botón para reintentar conexión (reconstruye client y borra caches de datos)
+    if st.button("Reintentar conexión a Sheets"):
+        st.cache_resource.clear()
+        st.cache_data.clear()
+        st.experimental_rerun()
 
     st.subheader("Agregar compra")
     with st.form("add_trade"):
@@ -923,3 +938,4 @@ elif menu == "Simulación Monte Carlo":
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Proyecto académico – Ingeniería Financiera")
+
