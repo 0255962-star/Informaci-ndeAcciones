@@ -13,28 +13,18 @@ from plotly.subplots import make_subplots
 # =====================================================
 st.set_page_config(page_title="Consulta de Acciones", page_icon="📊", layout="wide")
 
-# ---- Estilos (CSS) para un look más profesional ----
+# ---- Estilos (CSS) sobrios ----
 CUSTOM_CSS = """
 <style>
-/* ancho máximo del contenido */
 .main .block-container {max-width: 1200px; padding-top: 1rem; padding-bottom: 2rem;}
-/* títulos */
 h1, h2, h3 { font-weight: 700; letter-spacing: -0.2px; }
 h1 { margin-bottom: 0.25rem; }
 .section-subtitle { color: #6b7280; margin-bottom: 1.25rem; }
-/* separadores finos */
 .hr { border: none; border-top: 1px solid #e5e7eb; margin: 1.25rem 0; }
-/* sidebar */
-.css-1d391kg, .stSidebar { border-right: 1px solid #e5e7eb; }
+.stSidebar { border-right: 1px solid #e5e7eb; }
 .sidebar-title { font-weight: 700; font-size: 1.1rem; margin-top: 0.5rem; }
 .small { color:#6b7280; font-size:0.92rem; }
-label[for^="radio-"], label[for^="selectbox-"] { font-weight: 500; }
-/* tablas */
-.dataframe td, .dataframe th { font-size: 0.95rem; }
-/* inputs */
-.stTextInput>div>div>input, .stNumberInput input, .stSelectbox>div>div>div {
-  border-radius: 8px;
-}
+.stTextInput>div>div>input, .stNumberInput input, .stSelectbox>div>div>div { border-radius: 8px; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -141,32 +131,127 @@ def compute_beta_alpha(stock_returns: pd.Series, market_returns: pd.Series):
     return beta, alpha
 
 # =====================================================
-# PALETA/ESTILO DE GRAFICACIÓN
+# ESTILO DE GRÁFICAS
 # =====================================================
 TEMPLATE = "simple_white"
-COLOR_UP = "rgba(16,130,59,1)"
-COLOR_UP_FILL = "rgba(16,130,59,0.9)"
-COLOR_DOWN = "rgba(200,30,30,1)"
-COLOR_DOWN_FILL = "rgba(200,30,30,0.9)"
-SMA_COLORS = {"SMA20": "#6C5CE7", "SMA50": "#F39C12", "SMA200": "#B7950B"}
+COLOR_UP = "rgba(22,163,74,1)"       # verde
+COLOR_UP_FILL = "rgba(22,163,74,0.9)"
+COLOR_DOWN = "rgba(220,38,38,1)"     # rojo
+COLOR_DOWN_FILL = "rgba(220,38,38,0.9)"
+SMA_COLORS = {"SMA20": "#5546d6", "SMA50": "#f59e0b", "SMA200": "#b78d0a"}
+
+def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show_sma50=True, show_sma200=True):
+    """
+    Candlestick + volumen con mejores prácticas:
+    - Rango de tiempo configurable
+    - Range breaks (oculta fines de semana)
+    - Range selector + slider
+    - Hover unificado
+    - Trazas SMA opcionales
+    """
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.05, row_heights=[0.72, 0.28])
+
+    # Candles
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"],
+            name="OHLC",
+            increasing_line_color=COLOR_UP,
+            increasing_fillcolor=COLOR_UP_FILL,
+            decreasing_line_color=COLOR_DOWN,
+            decreasing_fillcolor=COLOR_DOWN_FILL,
+            # cuerpo/mecha más visibles
+            line=dict(width=1.2),
+            whiskerwidth=0.5,
+            showlegend=True,
+            opacity=0.95,
+        ),
+        row=1, col=1
+    )
+
+    # SMAs (opcionales)
+    if show_sma20 and "SMA20" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], mode="lines",
+                                 line=dict(color=SMA_COLORS["SMA20"], width=1.6),
+                                 name="SMA20"), row=1, col=1)
+    if show_sma50 and "SMA50" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], mode="lines",
+                                 line=dict(color=SMA_COLORS["SMA50"], width=1.6),
+                                 name="SMA50"), row=1, col=1)
+    if show_sma200 and "SMA200" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["SMA200"], mode="lines",
+                                 line=dict(color=SMA_COLORS["SMA200"], width=1.6),
+                                 name="SMA200"), row=1, col=1)
+
+    # Volumen coloreado por dirección
+    vol_colors = [COLOR_UP_FILL if c >= o else COLOR_DOWN_FILL for o, c in zip(df["Open"], df["Close"])]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vol_colors,
+                         name="Volumen", opacity=0.85), row=2, col=1)
+
+    # Ejes y layout
+    fig.update_xaxes(
+        showgrid=False,
+        rangeslider=dict(visible=True),
+        rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(step="year", stepmode="todate", label="YTD"),
+                dict(count=1, label="1Y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ]
+        ),
+        rangebreaks=[
+            dict(bounds=["sat", "mon"])  # oculta fines de semana
+        ],
+        row=1, col=1
+    )
+    fig.update_xaxes(showgrid=False, rangebreaks=[dict(bounds=["sat", "mon"])], row=2, col=1)
+
+    fig.update_yaxes(showgrid=True, zeroline=False, ticksuffix="", row=1, col=1)
+    fig.update_yaxes(title_text="Volumen", showgrid=True, zeroline=False, row=2, col=1)
+
+    fig.update_layout(
+        title=title,
+        template=TEMPLATE,
+        height=760,
+        margin=dict(l=40, r=20, t=48, b=30),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        dragmode="pan",
+    )
+    return fig
 
 # =====================================================
-# 1) CONSULTA DE ACCIONES
+# 1) CONSULTA DE ACCIONES — Candlestick mejorado
 # =====================================================
 if menu == "Consulta de Acciones":
     st.markdown("<h1>Consulta de Acciones</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Visualiza información general, descripción y gráficos interactivos.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Información de la empresa y gráfica de velas profesional.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
+    c0, c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1, 1.2])
+    with c0:
         stonk = st.text_input("Símbolo", "MSFT").strip().upper()
-    with c2:
+    with c1:
         range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("6 meses"))
+    with c2:
+        show_sma20 = st.checkbox("SMA20", value=True)
+    with c3:
+        show_sma50 = st.checkbox("SMA50", value=True)
+    with c4:
+        show_sma200 = st.checkbox("SMA200", value=False)
 
+    # Info
     ticker = yf.Ticker(stonk)
     info = ticker.info if hasattr(ticker, "info") else {}
-
     st.subheader("Empresa")
     st.write(info.get("longName", "No disponible"))
 
@@ -179,40 +264,14 @@ if menu == "Consulta de Acciones":
     period, interval = range_to_yf_params(range_key)
     hist = get_history(stonk, period, interval)
 
-    if hist.empty:
-        st.warning("No se pudo obtener información histórica.")
+    if hist.empty or not {"Open","High","Low","Close","Volume"}.issubset(hist.columns):
+        st.warning("No se pudo obtener información histórica suficiente.")
     else:
-        hist_sma = add_smas(hist, (20, 50, 200))
-
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.70, 0.30])
-
-        fig.add_trace(go.Candlestick(
-            x=hist_sma.index, open=hist_sma["Open"], high=hist_sma["High"],
-            low=hist_sma["Low"], close=hist_sma["Close"], name="OHLC",
-            increasing_line_color=COLOR_UP, increasing_fillcolor=COLOR_UP_FILL,
-            decreasing_line_color=COLOR_DOWN, decreasing_fillcolor=COLOR_DOWN_FILL,
-            line=dict(width=1.25), whiskerwidth=0.3
-        ), row=1, col=1)
-
-        for k, col in SMA_COLORS.items():
-            if k in hist_sma.columns:
-                fig.add_trace(
-                    go.Scatter(x=hist_sma.index, y=hist_sma[k], mode="lines",
-                               line=dict(color=col, width=1.4), name=k),
-                    row=1, col=1
-                )
-
-        vol_colors = [COLOR_UP_FILL if c >= o else COLOR_DOWN_FILL for o, c in zip(hist_sma["Open"], hist_sma["Close"])]
-        fig.add_trace(go.Bar(x=hist_sma.index, y=hist_sma["Volume"],
-                             marker_color=vol_colors, name="Volumen", opacity=0.85), row=2, col=1)
-
-        fig.update_layout(
-            title=f"{stonk} · {range_key}",
-            template=TEMPLATE, height=740,
-            margin=dict(l=40, r=20, t=48, b=30),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis_rangeslider_visible=True
+        hist = add_smas(hist, (20, 50, 200))
+        title = f"{stonk} · {range_key}"
+        fig = plot_candles_with_volume(
+            hist, title,
+            show_sma20=show_sma20, show_sma50=show_sma50, show_sma200=show_sma200
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -296,7 +355,7 @@ elif menu == "Riesgo de Inversión":
 # =====================================================
 elif menu == "CAPM":
     st.markdown("<h1>CAPM</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Rendimiento esperado en función de β y el premio por riesgo.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Rendimiento esperado en función de β y del premio por riesgo.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
