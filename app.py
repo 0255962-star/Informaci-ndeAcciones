@@ -249,7 +249,7 @@ if menu == "Consulta de Acciones":
     with c4:
         show_sma200 = st.checkbox("SMA200", value=False)
 
-    # Info
+    # Información básica
     ticker = yf.Ticker(stonk)
     info = ticker.info if hasattr(ticker, "info") else {}
     st.subheader("Empresa")
@@ -261,17 +261,31 @@ if menu == "Consulta de Acciones":
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     st.subheader("Gráfica de velas con volumen")
 
+    # === FIX: nueva descarga más robusta ===
     period, interval = range_to_yf_params(range_key)
-    hist = get_history(stonk, period, interval)
+    try:
+        hist = ticker.history(period=period, interval=interval, auto_adjust=False)
+    except Exception as e:
+        hist = pd.DataFrame()
+        st.error(f"Error al obtener datos: {e}")
 
-    if hist.empty or not {"Open","High","Low","Close","Volume"}.issubset(hist.columns):
-        st.warning("No se pudo obtener información histórica suficiente.")
+    # === Validación robusta ===
+    required_cols = {"Open", "High", "Low", "Close", "Volume"}
+    if hist.empty or not required_cols.issubset(hist.columns):
+        st.warning("No se pudo obtener información histórica suficiente. Intenta con otro rango o símbolo válido.")
     else:
+        # Relleno si hay valores NaN
+        hist = hist.dropna(subset=["Open", "High", "Low", "Close"]).copy()
         hist = add_smas(hist, (20, 50, 200))
+
+        # Gráfica
         title = f"{stonk} · {range_key}"
         fig = plot_candles_with_volume(
-            hist, title,
-            show_sma20=show_sma20, show_sma50=show_sma50, show_sma200=show_sma200
+            hist,
+            title,
+            show_sma20=show_sma20,
+            show_sma50=show_sma50,
+            show_sma200=show_sma200
         )
         st.plotly_chart(fig, use_container_width=True)
 
