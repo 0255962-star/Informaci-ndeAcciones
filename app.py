@@ -1,5 +1,8 @@
 # App.py — Panel de Finanzas con Google Sheets (Transactions) + Gemini + Plotly
-# Mod: manejo robusto de Google Sheets (no cachear Worksheet, reintentos y botón de reconexión)
+# Cambios:
+# - Botón Reintentar conexión usa st.rerun()
+# - Worksheet no cacheado; reintento al abrir
+# - Saneado de NaN/Inf al subir a Sheets (evita "Out of range float values are not JSON compliant")
 
 import os
 import re
@@ -308,7 +311,7 @@ def translate_to_spanish(text: str) -> str:
     return generate_content_rest(base, model, prompt)
 
 # =========================================================
-# GOOGLE SHEETS — conexión y utilidades (FIX: no cachear Worksheet)
+# GOOGLE SHEETS — conexión y utilidades (Worksheet NO cacheado)
 # =========================================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -328,10 +331,7 @@ def get_gs_client():
     return gspread.authorize(creds)
 
 def open_transactions_ws(force_retry: bool = True):
-    """
-    Abre SIEMPRE un worksheet nuevo (no cachea el handle).
-    Si falla y force_retry=True, limpia el cache del client y reintenta una vez.
-    """
+    """Abre SIEMPRE un worksheet nuevo (no cachea el handle). Reintenta una vez si falla."""
     def _open():
         client = get_gs_client()
         if client is None:
@@ -407,12 +407,20 @@ def append_transaction_row(ticker: str, trade_date: str, shares: float, price: f
     ws = open_transactions_ws(force_retry=True)
     if ws is None:
         raise RuntimeError("No se pudo abrir la hoja de transacciones. Verifica secrets y permisos.")
+    # normalizar price/fees para JSON
+    def norm_num(x):
+        if x is None: return ""
+        try:
+            if isinstance(x, float) and (np.isnan(x) or np.isinf(x)): return ""
+            return float(x)
+        except Exception:
+            return ""
     row = [
-        ticker.upper(),
+        ticker.upper().strip(),
         trade_date,
-        shares,
-        "" if price is None or np.isnan(price) else float(price),
-        0.0 if fees is None or np.isnan(fees) else float(fees),
+        norm_num(shares),
+        norm_num(price),
+        norm_num(fees),
         notes or ""
     ]
     values = ws.get_all_values()
@@ -423,21 +431,36 @@ def append_transaction_row(ticker: str, trade_date: str, shares: float, price: f
         ws.append_row(row, value_input_option="USER_ENTERED")
 
 def overwrite_transactions_df(df: pd.DataFrame):
+    """Reemplaza toda la pestaña 'Transactions' con df, saneando valores para JSON."""
     ws = open_transactions_ws(force_retry=True)
     if ws is None:
         raise RuntimeError("No se pudo abrir la hoja de transacciones.")
+
+    cols = ["Ticker", "TradeDate", "Shares", "Price", "Fees", "Notes"]
     out = df.copy()
-    cols = ["Ticker","TradeDate","Shares","Price","Fees","Notes"]
     for c in cols:
-        if c not in out.columns: out[c] = ""
+        if c not in out.columns:
+            out[c] = ""
+
     out = out[cols].copy()
-    out["TradeDate"] = out["TradeDate"].apply(lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp) else str(x))
+    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+
+    out["TradeDate"] = out["TradeDate"].apply(
+        lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp)
+        else ("" if pd.isna(x) else str(x))
+    )
+    for c in ["Shares","Price","Fees"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.replace([np.nan, np.inf, -np.inf], "")
+
     ws.clear()
-    ws.update([cols] + out.values.tolist())
+    ws.update([cols] + out.astype(object).values.tolist(), value_input_option="USER_ENTERED")
 
 def delete_ticker_all_rows(ticker: str):
     df = read_transactions_df()
-    if df.empty: return False
+    if df.empty:
+        return False
     ticker = ticker.upper().strip()
     filtered = df[df["Ticker"] != ticker].copy()
     if len(filtered) == len(df):
@@ -557,7 +580,7 @@ elif menu == "Mi Portafolio (Google Sheets)":
     if st.button("Reintentar conexión a Sheets"):
         st.cache_resource.clear()
         st.cache_data.clear()
-        st.experimental_rerun()
+        st.rerun()
 
     st.subheader("Agregar compra")
     with st.form("add_trade"):
@@ -583,6 +606,7 @@ elif menu == "Mi Portafolio (Google Sheets)":
             )
             st.success(f"Compra de {at_ticker} guardada en Transactions.")
             st.cache_data.clear()
+            st.rerun()
         except Exception as e:
             st.error(f"No se pudo guardar la compra: {e}")
 
@@ -670,6 +694,7 @@ elif menu == "Mi Portafolio (Google Sheets)":
                 if ok:
                     st.success(f"Se eliminaron las transacciones de {del_ticker} en Google Sheets.")
                     st.cache_data.clear()
+                    st.rerun()
                 else:
                     st.warning("No se encontraron filas para eliminar (ya no existían).")
             except Exception as e:
@@ -680,7 +705,7 @@ elif menu == "Evaluar nueva acción (básico)":
     st.markdown('<div class="section-subtitle">Compara tu portafolio actual vs. agregar un ticker con acciones propuestas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    tx = read_transactions_df()
+    tx = read_transactions_df()  # lectura fresca
     if tx.empty:
         st.warning("No hay transacciones en Google Sheets. Agrega compras en la sección 'Mi Portafolio'.")
         st.stop()
@@ -703,8 +728,7 @@ elif menu == "Evaluar nueva acción (básico)":
     pos = tx.groupby("Ticker", as_index=False).agg({"Shares":"sum","MktValue":"sum"})
 
     shares_map = pos.set_index("Ticker")["Shares"].to_dict()
-    aligned = prices.copy()
-    aligned = aligned.reindex(columns=[c for c in aligned.columns if c in shares_map], fill_value=np.nan)
+    aligned = prices.copy().reindex(columns=[c for c in prices.columns if c in shares_map], fill_value=np.nan)
     for t in aligned.columns:
         aligned[t] = aligned[t] * shares_map.get(t, 0.0)
     port_value = aligned.sum(axis=1).dropna()
@@ -712,8 +736,7 @@ elif menu == "Evaluar nueva acción (básico)":
 
     shares_map_after = shares_map.copy()
     shares_map_after[new_ticker] = shares_map_after.get(new_ticker, 0.0) + shares_new
-    aligned_after = prices.copy()
-    aligned_after = aligned_after.reindex(columns=[c for c in aligned_after.columns if c in shares_map_after], fill_value=np.nan)
+    aligned_after = prices.copy().reindex(columns=[c for c in prices.columns if c in shares_map_after], fill_value=np.nan)
     for t in aligned_after.columns:
         aligned_after[t] = aligned_after[t] * shares_map_after.get(t, 0.0)
     port_value_after = aligned_after.sum(axis=1).dropna()
