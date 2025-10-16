@@ -1,3 +1,4 @@
+# App.py — Panel de Finanzas con Google Sheets (Transactions) + Gemini + Plotly
 import os
 import re
 import json
@@ -8,8 +9,9 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from datetime import datetime
 
-# ===== Google Sheets (autenticación con Service Account) =====
+# ===== Google Sheets (Service Account) =====
 from google.oauth2.service_account import Credentials
 import gspread
 
@@ -18,7 +20,7 @@ import gspread
 # =========================================================
 st.set_page_config(page_title="Finanzas – Panel", page_icon="📈", layout="wide")
 
-# Estilo sobrio
+# Estilo sobrio/profesional
 st.markdown("""
 <style>
 .main .block-container {max-width: 1220px; padding-top: 1rem; padding-bottom: 2rem;}
@@ -45,7 +47,7 @@ menu = st.sidebar.radio(
     [
         "Consulta de Acciones",
         "Mi Portafolio (Google Sheets)",
-        "Evaluar nueva acción (básico)",   # << NUEVO
+        "Evaluar nueva acción (básico)",
         "Riesgo de Inversión",
         "CAPM",
         "Optimización de Portafolio (Markowitz)",
@@ -53,7 +55,9 @@ menu = st.sidebar.radio(
     ],
 )
 
+# =========================================================
 # Periodos estándar
+# =========================================================
 RANGE_OPTIONS = ["1 semana", "1 mes", "6 meses", "1 año", "YTD", "3 años", "5 años"]
 
 def range_to_yf_params(range_key: str):
@@ -88,31 +92,30 @@ def get_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
         return pd.DataFrame()
     return df.dropna(subset=["Open","High","Low","Close"])
 
-def add_smas(df: pd.DataFrame, windows=(20,50,200)):
-    out = df.copy()
-    for w in windows:
-        out[f"SMA{w}"] = out["Close"].rolling(w).mean()
-    return out
-
-def return_metrics(df: pd.DataFrame):
-    d = df.copy()
-    d["Return"] = d["Close"].pct_change()
-    d["LogReturn"] = np.log(d["Close"] / d["Close"].shift(1))
-    d = d.dropna()
-    avg_daily = d["Return"].mean()
-    ann_return = (1 + avg_daily) ** 252 - 1
-    ann_vol = d["Return"].std() * np.sqrt(252)
-    return d, ann_return, ann_vol
+@st.cache_data(ttl=1200)
+def get_last_close(symbol: str) -> float:
+    try:
+        df = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False)
+        if df is not None and not df.empty:
+            return float(df["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+    try:
+        df = yf.download(symbol, period="5d", interval="1d", auto_adjust=False, progress=False, threads=False)
+        if df is not None and not df.empty:
+            return float(df["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+    return np.nan
 
 @st.cache_data(ttl=1800)
-def load_prices(tickers, period="1y", interval="1d") -> pd.DataFrame:
+def load_prices(tickers, period="5y", interval="1d") -> pd.DataFrame:
     if isinstance(tickers, str): tickers = [tickers]
     tickers = [t for t in tickers if t]
     if not tickers: return pd.DataFrame()
     raw = yf.download(tickers, period=period, interval=interval, auto_adjust=True,
                       progress=False, threads=False)
     if raw.empty: return pd.DataFrame()
-
     if isinstance(raw.columns, pd.MultiIndex):
         if "Close" in raw.columns.levels[0]:
             prices = raw["Close"].copy()
@@ -129,8 +132,17 @@ def load_prices(tickers, period="1y", interval="1d") -> pd.DataFrame:
         else:
             return pd.DataFrame()
         prices.columns = [tickers[0]]
-
     return prices.dropna(how="all")
+
+def return_metrics(df: pd.DataFrame):
+    d = df.copy()
+    d["Return"] = d["Close"].pct_change()
+    d["LogReturn"] = np.log(d["Close"] / d["Close"].shift(1))
+    d = d.dropna()
+    avg_daily = d["Return"].mean()
+    ann_return = (1 + avg_daily) ** 252 - 1
+    ann_vol = d["Return"].std() * np.sqrt(252)
+    return d, ann_return, ann_vol
 
 def compute_beta_alpha(stock_returns: pd.Series, market_returns: pd.Series):
     merged = pd.concat([stock_returns, market_returns], axis=1, join="inner").dropna()
@@ -169,12 +181,18 @@ def ratio(x):
     except Exception: return "N/A"
 
 # =========================================================
-# GRÁFICOS
+# GRÁFICOS (Plotly)
 # =========================================================
 TEMPLATE = "simple_white"
 COLOR_UP, COLOR_UP_FILL = "rgba(22,163,74,1)", "rgba(22,163,74,0.9)"
 COLOR_DOWN, COLOR_DOWN_FILL = "rgba(220,38,38,1)", "rgba(220,38,38,0.9)"
 SMA_COLORS = {"SMA20":"#5546d6","SMA50":"#f59e0b","SMA200":"#b78d0a"}
+
+def add_smas(df: pd.DataFrame, windows=(20,50,200)):
+    out = df.copy()
+    for w in windows:
+        out[f"SMA{w}"] = out["Close"].rolling(w).mean()
+    return out
 
 def plot_candles_with_volume(df: pd.DataFrame, title: str,
                              show_sma20=True, show_sma50=True, show_sma200=False):
@@ -289,7 +307,7 @@ def translate_to_spanish(text: str) -> str:
     return generate_content_rest(base, model, prompt)
 
 # =========================================================
-# GOOGLE SHEETS
+# GOOGLE SHEETS — conexión y utilidades (sin exponer claves en UI)
 # =========================================================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
 
@@ -312,20 +330,95 @@ def parse_spreadsheet_target(text: str):
         return None, text
     return text, None                  # nombre del spreadsheet
 
-@st.cache_data(ttl=300)
-def read_portfolio_from_sheet(spreadsheet_target: str, worksheet_name: str = "Portafolio") -> pd.DataFrame:
+@st.cache_data(ttl=120)
+def open_transactions_ws():
+    """Abre el worksheet de transacciones según secrets (sin UI de claves)."""
     client = get_gs_client()
-    if client is None: return pd.DataFrame()
-    title, key = parse_spreadsheet_target(spreadsheet_target)
+    if client is None: return None
+    target = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
+    ws_name = st.secrets.get("GSHEETS_TRANSACTIONS_WS", "Transactions")
+    if not target: return None
+    title, key = parse_spreadsheet_target(target)
     try:
         sh = client.open_by_key(key) if key else client.open(title)
-        ws = sh.worksheet(worksheet_name)
-        data = ws.get_all_records()
-        return pd.DataFrame(data)
+        ws = sh.worksheet(ws_name)
+        return ws
+    except Exception:
+        return None
+
+def read_transactions_df() -> pd.DataFrame:
+    ws = open_transactions_ws()
+    if ws is None:
+        return pd.DataFrame()
+    try:
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        # Normaliza columnas si faltan
+        for col in ["Ticker","TradeDate","Shares","Price","Fees","Notes"]:
+            if col not in df.columns:
+                df[col] = "" if col in ["TradeDate","Notes"] else 0
+        # Tipos
+        df["Ticker"] = df["Ticker"].astype(str).str.upper()
+        df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce")
+        df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce")
+        df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+        df["Fees"] = pd.to_numeric(df["Fees"], errors="coerce")
+        df = df.dropna(subset=["Ticker","Shares"])
+        df = df[df["Ticker"]!=""]
+        return df
     except Exception:
         return pd.DataFrame()
 
-# Clasificación simple
+def append_transaction_row(ticker: str, trade_date: str, shares: float, price: float=None, fees: float=0.0, notes: str=""):
+    ws = open_transactions_ws()
+    if ws is None:
+        raise RuntimeError("No se pudo abrir la hoja de transacciones. Verifica secrets y permisos.")
+    row = [
+        ticker.upper(),
+        trade_date,
+        shares,
+        "" if price is None or np.isnan(price) else float(price),
+        0.0 if fees is None or np.isnan(fees) else float(fees),
+        notes or ""
+    ]
+    # Encabezados esperados
+    headers = ["Ticker","TradeDate","Shares","Price","Fees","Notes"]
+    # Si la hoja está vacía, escribe encabezados primero
+    values = ws.get_all_values()
+    if not values:
+        ws.update([headers, row])
+    else:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+
+def overwrite_transactions_df(df: pd.DataFrame):
+    ws = open_transactions_ws()
+    if ws is None:
+        raise RuntimeError("No se pudo abrir la hoja de transacciones.")
+    # Orden de columnas
+    out = df.copy()
+    cols = ["Ticker","TradeDate","Shares","Price","Fees","Notes"]
+    for c in cols:
+        if c not in out.columns: out[c] = ""
+    out = out[cols].copy()
+    # Convierte fechas a texto YYYY-MM-DD
+    out["TradeDate"] = out["TradeDate"].apply(lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp) else str(x))
+    # Limpia y actualiza
+    ws.clear()
+    ws.update([cols] + out.values.tolist())
+
+def delete_ticker_all_rows(ticker: str):
+    df = read_transactions_df()
+    if df.empty: return False
+    ticker = ticker.upper().strip()
+    filtered = df[df["Ticker"] != ticker].copy()
+    if len(filtered) == len(df):  # no encontró
+        return False
+    overwrite_transactions_df(filtered)
+    return True
+
+# =========================================================
+# Clasificación simple de tickers (agrupación)
+# =========================================================
 TECH_HIGH = {"NVDA","GOOG","GOOGL","META","MSFT","AMZN","TSLA","AMD","AVGO"}
 LOW_VOL = {"KO","PG","JNJ","PEP","COST","WMT","MCD","MRK","HD"}
 INDEX_ETF = {"SPY","VOO","IVV","^GSPC","QQQ","IWM"}
@@ -369,10 +462,7 @@ if menu == "Consulta de Acciones":
     st.write(summary if summary else "No disponible.")
 
     # Botón de traducción
-    col_tr = st.columns([1,3])[0]
-    with col_tr:
-        translate_clicked = st.button("Traducir a español")
-    if translate_clicked:
+    if st.button("Traducir a español"):
         if not API_KEY:
             st.warning("Configura GOOGLE_API_KEY en Secrets para traducir con Gemini.")
         elif not summary:
@@ -432,193 +522,196 @@ if menu == "Consulta de Acciones":
         )
 
 # =========================================================
-# SECCIÓN: MI PORTAFOLIO (GOOGLE SHEETS)
+# SECCIÓN: MI PORTAFOLIO (GOOGLE SHEETS, Transactions, CRUD)
 # =========================================================
 elif menu == "Mi Portafolio (Google Sheets)":
     st.markdown("<h1>Mi Portafolio</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Conectado a Google Sheets. Rendimiento, riesgo y contribuciones.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Lectura de transacciones, cálculo de pesos por valor de mercado, altas y bajas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    colA, colB, colC = st.columns([2.2,1.2,1])
-    with colA:
-        default_target = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
-        spreadsheet_target = st.text_input("Spreadsheet (nombre, URL o ID)", value=default_target)
-    with colB:
-        default_ws = st.secrets.get("GSHEETS_WORKSHEET_NAME", "Portafolio")
-        worksheet = st.text_input("Worksheet", value=default_ws)
-    with colC:
-        range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
+    # ---- Formulario: Agregar compra ----
+    st.subheader("Agregar compra")
+    with st.form("add_trade"):
+        c1,c2,c3 = st.columns([1.2,1,1])
+        with c1: at_ticker = st.text_input("Ticker", "SPY").upper().strip()
+        with c2: at_date = st.date_input("Fecha de compra", value=pd.to_datetime("2020-10-16"))
+        with c3: at_shares = st.number_input("Acciones", min_value=0.0, value=10.0, step=1.0)
+        c4,c5,c6 = st.columns([1,1,2])
+        with c4: at_price = st.number_input("Precio de compra (opcional)", min_value=0.0, value=0.0, step=0.01)
+        with c5: at_fees = st.number_input("Comisiones (opcional)", min_value=0.0, value=0.0, step=0.01)
+        with c6: at_notes = st.text_input("Notas", "Alta manual desde app")
+        submitted = st.form_submit_button("Guardar compra")
+    if submitted:
+        try:
+            price_val = None if at_price == 0 else float(at_price)
+            append_transaction_row(
+                ticker=at_ticker,
+                trade_date=pd.to_datetime(at_date).strftime("%Y-%m-%d"),
+                shares=float(at_shares),
+                price=price_val,
+                fees=float(at_fees),
+                notes=at_notes,
+            )
+            st.success(f"Compra de {at_ticker} guardada en Transactions.")
+            st.cache_data.clear()   # limpia caches de lectura
+        except Exception as e:
+            st.error(f"No se pudo guardar la compra: {e}")
 
-    df_sheet = read_portfolio_from_sheet(spreadsheet_target, worksheet) if spreadsheet_target else pd.DataFrame()
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    SAMPLE = pd.DataFrame({
-        "Ticker":["SPY","KO","PG","JNJ","PEP","COST","NVDA","GOOG","META","MSFT","AMZN"],
-        "Weight":[0.30,0.08,0.07,0.06,0.05,0.04,0.12,0.09,0.08,0.06,0.05]
-    })
-
-    if df_sheet.empty or not {"Ticker","Weight"}.issubset(df_sheet.columns):
-        st.warning("No se pudo leer el portafolio desde Sheets. Se muestra un ejemplo (edita tu Google Sheets para reemplazarlo).")
-        pf = SAMPLE.copy()
-    else:
-        pf = df_sheet[["Ticker","Weight"]].copy()
-        pf["Ticker"] = pf["Ticker"].astype(str).str.upper()
-        pf["Weight"] = pd.to_numeric(pf["Weight"], errors="coerce").fillna(0)
-
-    s = pf["Weight"].sum()
-    if s <= 0:
-        st.error("Los pesos de la hoja están vacíos o suman 0. Ajusta tu Google Sheets.")
+    # ---- Leer transacciones ----
+    tx = read_transactions_df()
+    if tx.empty:
+        st.warning("No se pudieron leer transacciones desde Google Sheets. Verifica secrets/permisos/pestaña 'Transactions'.")
         st.stop()
-    pf["Weight"] = pf["Weight"]/s
-    pf["Grupo"] = pf["Ticker"].apply(classify_ticker)
 
-    period, interval = range_to_yf_params(range_key)
-    tickers = pf["Ticker"].tolist()
-    prices = load_prices(tickers, period=period, interval=interval)
-
+    # ---- Universo de tickers y precios históricos (5y) ----
+    tickers = sorted(tx["Ticker"].unique().tolist())
+    prices = load_prices(tickers, period="5y", interval="1d")
     if prices.empty:
-        st.error("No se pudieron descargar precios para los tickers del portafolio.")
+        st.error("No se pudieron descargar precios para construir el histórico a 5 años.")
         st.stop()
 
-    rets = prices.pct_change().dropna()
-    weights = pf.set_index("Ticker")["Weight"].reindex(rets.columns).fillna(0).values
-    port_ret = rets.dot(weights)
+    # ---- Valor de mercado actual y pesos ----
+    last_prices = {t: get_last_close(t) for t in tickers}
+    tx["LastPrice"] = tx["Ticker"].map(last_prices)
+    tx["MktValue"] = tx["Shares"] * tx["LastPrice"]
+    # Agrupar por ticker
+    pos = tx.groupby("Ticker", as_index=False).agg({"Shares":"sum","MktValue":"sum"})
+    total_mv = pos["MktValue"].sum()
+    pos["Weight"] = pos["MktValue"] / total_mv if total_mv > 0 else 0.0
+    pos["Grupo"] = pos["Ticker"].apply(classify_ticker)
 
+    # ---- Métricas del portafolio con posiciones (valor por camino) ----
+    # Construye un valor de portafolio diario: sum_t (Shares_ticker_total * Price_ticker_dia)
+    shares_map = pos.set_index("Ticker")["Shares"].to_dict()
+    aligned = prices.copy()
+    aligned = aligned.reindex(columns=[c for c in aligned.columns if c in shares_map], fill_value=np.nan)
+    # Broadcast shares
+    for t in aligned.columns:
+        aligned[t] = aligned[t] * shares_map.get(t, 0.0)
+    port_value = aligned.sum(axis=1).dropna()
+    if port_value.empty:
+        st.error("No se pudo construir la serie de valor del portafolio (revisa precios/acciones).")
+        st.stop()
+    port_ret = port_value.pct_change().dropna()
     ann_ret = (1 + port_ret.mean())**252 - 1
     ann_vol = port_ret.std() * np.sqrt(252)
-    rf = st.number_input("Tasa libre de riesgo (Sharpe)", value=0.04, step=0.01)
+    rf = st.number_input("Tasa libre de riesgo (Sharpe)", value=0.04, step=0.01, key="rf_pf")
     sharpe = (ann_ret - rf) / ann_vol if ann_vol > 0 else np.nan
-
-    bench = st.selectbox("Benchmark para β", options=["SPY","^GSPC","QQQ"], index=0)
-    bench_prices = load_prices([bench], period=period, interval=interval)
-    beta = np.nan
-    if not bench_prices.empty:
-        bench_ret = bench_prices.pct_change().dropna().iloc[:,0]
-        merged = pd.concat([port_ret, bench_ret], axis=1, join="inner").dropna()
-        if merged.shape[0] >= 2:
-            cov = np.cov(merged.iloc[:,0], merged.iloc[:,1])[0][1]
-            var_m = merged.iloc[:,1].var()
-            beta = cov/var_m if var_m != 0 else np.nan
+    mdd = max_drawdown((1+port_ret).cumprod())
 
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Rendimiento anualizado", f"{ann_ret*100:.2f}%")
     c2.metric("Volatilidad anualizada", f"{ann_vol*100:.2f}%")
     c3.metric("Sharpe", f"{sharpe:.2f}")
-    c4.metric(f"Beta vs {bench}", f"{beta:.2f}")
+    c4.metric("Max Drawdown (5y)", f"{mdd*100:.2f}%")
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
+    # ---- Gráfico de rendimiento acumulado 5y ----
     port_cum = (1 + port_ret).cumprod()
     fig_perf = go.Figure()
-    fig_perf.add_trace(go.Scatter(x=port_cum.index, y=port_cum.values, mode="lines", name="Portafolio"))
-    if not bench_prices.empty:
-        bench_ret = bench_prices.pct_change().dropna().iloc[:,0]
-        bench_cum = (1 + bench_ret).reindex(port_ret.index, method="nearest")
-        bench_cum = (1 + bench_cum).cumprod()
-        fig_perf.add_trace(go.Scatter(x=bench_cum.index, y=bench_cum.values, mode="lines", name=bench))
-    fig_perf.update_layout(title=f"Rendimiento acumulado · {range_key}", template=TEMPLATE,
-                           xaxis_title="", yaxis_title="Crecimiento de $1", height=420)
+    fig_perf.add_trace(go.Scatter(x=port_cum.index, y=port_cum.values, mode="lines", name="Portafolio (valor)"))
+    fig_perf.update_layout(title="Crecimiento de $1 · 5 años (basado en tus Shares)", template=TEMPLATE,
+                           xaxis_title="", yaxis_title="Crecimiento", height=420)
     st.plotly_chart(fig_perf, use_container_width=True)
 
-    cov_ann = rets.cov() * 252
-    if cov_ann.shape[0] == len(weights):
-        sigma_p = float(np.sqrt(weights.T @ cov_ann.values @ weights))
-        if sigma_p > 0:
-            mcontrib = cov_ann.values @ weights / sigma_p
-            rcontrib = weights * mcontrib
-            rc_df = pd.DataFrame({"Ticker": rets.columns, "RiskContribution": rcontrib})
-            rc_df["Share"] = rc_df["RiskContribution"] / rc_df["RiskContribution"].sum()
-            rc_df = rc_df.sort_values("Share", ascending=False)
-            fig_rc = go.Figure(go.Bar(x=rc_df["Ticker"], y=rc_df["Share"]*100))
-            fig_rc.update_layout(title="Contribución al riesgo (%)", template=TEMPLATE,
-                                 xaxis_title="", yaxis_title="% de riesgo")
-            st.plotly_chart(fig_rc, use_container_width=True)
-
-    grp = pf.groupby("Grupo", as_index=False)["Weight"].sum().sort_values("Weight", ascending=False)
+    # ---- Distribución por grupo ----
+    grp = pos.groupby("Grupo", as_index=False)["MktValue"].sum().sort_values("MktValue", ascending=False)
     if not grp.empty:
-        fig_grp = go.Figure(data=[go.Pie(labels=grp["Grupo"], values=grp["Weight"], hole=0.5)])
-        fig_grp.update_layout(title="Distribución por grupo", template=TEMPLATE, height=400)
+        fig_grp = go.Figure(data=[go.Pie(labels=grp["Grupo"], values=grp["MktValue"], hole=0.5)])
+        fig_grp.update_layout(title="Distribución por grupo (valor de mercado)", template=TEMPLATE, height=380)
         st.plotly_chart(fig_grp, use_container_width=True)
 
-    indiv_ann_ret = (1 + rets.mean())**252 - 1
-    indiv_ann_vol = rets.std() * np.sqrt(252)
-    detail = pd.DataFrame({
-        "Weight": pf.set_index("Ticker")["Weight"],
-        "Grupo": pf.set_index("Ticker")["Grupo"],
-        "AnnReturn": indiv_ann_ret,
-        "AnnVol": indiv_ann_vol
-    }).reindex(rets.columns)
+    # ---- Detalle por activo (con botón de eliminar) ----
     st.subheader("Detalle por activo")
-    st.dataframe(detail.style.format({"Weight":"{:.2%}","AnnReturn":"{:.2%}","AnnVol":"{:.2%}"}), use_container_width=True)
+    pos_view = pos.copy()
+    pos_view["LastPrice"] = pos_view["Ticker"].map(last_prices)
+    pos_view = pos_view[["Ticker","Grupo","Shares","LastPrice","MktValue","Weight"]]
+    pos_view = pos_view.sort_values("MktValue", ascending=False)
+    st.dataframe(
+        pos_view.style.format({
+            "Shares":"{:.2f}",
+            "LastPrice":"${:,.2f}",
+            "MktValue":"${:,.2f}",
+            "Weight":"{:.2%}"
+        }),
+        use_container_width=True
+    )
+
+    # Zona de eliminación
+    st.markdown("##### Eliminar activo del portafolio")
+    del_col1, del_col2 = st.columns([1.5,1])
+    with del_col1:
+        del_ticker = st.selectbox("Selecciona ticker a eliminar", options=pos_view["Ticker"].tolist())
+    with del_col2:
+        if st.button("🗑️ Eliminar activo"):
+            try:
+                ok = delete_ticker_all_rows(del_ticker)
+                if ok:
+                    st.success(f"Se eliminaron las transacciones de {del_ticker} en Google Sheets.")
+                    st.cache_data.clear()
+                else:
+                    st.warning("No se encontraron filas para eliminar (ya no existían).")
+            except Exception as e:
+                st.error(f"No se pudo eliminar: {e}")
 
 # =========================================================
-# SECCIÓN: EVALUAR NUEVA ACCIÓN (BÁSICO)  << NUEVO
+# SECCIÓN: EVALUAR NUEVA ACCIÓN (BÁSICO)
 # =========================================================
 elif menu == "Evaluar nueva acción (básico)":
     st.markdown("<h1>Evaluar nueva acción (básico)</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Compara tu portafolio actual vs. agregar un ticker con peso propuesto.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Compara tu portafolio actual vs. agregar un ticker con acciones propuestas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    colA, colB, colC, colD = st.columns([2.1,1.1,1,1])
-    with colA:
-        spreadsheet_target = st.text_input("Spreadsheet (nombre, URL o ID)", value=st.secrets.get("GSHEETS_SPREADSHEET_NAME",""))
-    with colB:
-        worksheet = st.text_input("Worksheet", value=st.secrets.get("GSHEETS_WORKSHEET_NAME","Portafolio"))
-    with colC:
-        range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
-    with colD:
-        rf = st.number_input("Tasa libre de riesgo", value=0.04, step=0.01)
+    # Lee posiciones actuales desde transacciones (sin exponer claves)
+    tx = read_transactions_df()
+    if tx.empty:
+        st.warning("No hay transacciones en Google Sheets. Agrega compras en la sección 'Mi Portafolio'.")
+        st.stop()
 
-    c1, c2, c3 = st.columns([1.2,1,1])
+    # Form inputs
+    c1,c2,c3,c4 = st.columns([1.2,1,1,1])
     with c1: new_ticker = st.text_input("Ticker candidato", "NFLX").upper().strip()
-    with c2: new_weight = st.slider("Peso propuesto", min_value=0.0, max_value=0.20, value=0.05, step=0.01)
+    with c2: shares_new = st.number_input("Acciones a comprar", min_value=0.0, value=5.0, step=1.0)
     with c3: bench = st.selectbox("Benchmark (β)", options=["SPY","^GSPC","QQQ"], index=0)
+    with c4: rf = st.number_input("Tasa libre de riesgo", value=0.04, step=0.01)
 
-    # Leer portafolio base
-    df_sheet = read_portfolio_from_sheet(spreadsheet_target, worksheet) if spreadsheet_target else pd.DataFrame()
-    SAMPLE = pd.DataFrame({
-        "Ticker":["SPY","KO","PG","JNJ","PEP","COST","NVDA","GOOG","META","MSFT","AMZN"],
-        "Weight":[0.30,0.08,0.07,0.06,0.05,0.04,0.12,0.09,0.08,0.06,0.05]
-    })
-    if df_sheet.empty or not {"Ticker","Weight"}.issubset(df_sheet.columns):
-        pf = SAMPLE.copy()
-        st.info("Usando portafolio de ejemplo (no se pudo leer tu Sheets).")
-    else:
-        pf = df_sheet[["Ticker","Weight"]].copy()
-        pf["Ticker"] = pf["Ticker"].astype(str).str.upper()
-        pf["Weight"] = pd.to_numeric(pf["Weight"], errors="coerce").fillna(0)
-
-    # Normalizar pesos base
-    s = pf["Weight"].sum()
-    if s <= 0:
-        st.error("Los pesos de la hoja están vacíos o suman 0. Ajusta tu Google Sheets.")
-        st.stop()
-    pf["Weight"] = pf["Weight"] / s
-
-    # Construir pesos "antes" y "después"
-    period, interval = range_to_yf_params(range_key)
-    base_tickers = pf["Ticker"].tolist()
-    tickers_all = sorted(list(set(base_tickers + [new_ticker])))
-    prices = load_prices(tickers_all + [bench], period=period, interval=interval)
-    if prices.empty or prices.shape[0] < 10:
-        st.warning("No hay datos suficientes para el periodo elegido.")
+    # Construye posiciones actuales
+    tickers = sorted(tx["Ticker"].unique().tolist())
+    prices = load_prices(sorted(list(set(tickers + [new_ticker, bench]))), period="1y", interval="1d")
+    if prices.empty:
+        st.warning("No hay datos de precios para evaluar.")
         st.stop()
 
-    rets = prices.pct_change().dropna()
-    # Portafolio base
-    w_base = pf.set_index("Ticker")["Weight"].reindex(rets.columns, fill_value=0.0).values
-    port_base = rets.dot(w_base)
+    last_prices = {t: get_last_close(t) for t in prices.columns}
+    tx["LastPrice"] = tx["Ticker"].map(last_prices)
+    tx["MktValue"] = tx["Shares"] * tx["LastPrice"]
+    pos = tx.groupby("Ticker", as_index=False).agg({"Shares":"sum","MktValue":"sum"})
+    total_mv = pos["MktValue"].sum()
 
-    # Portafolio con candidato: reescalar base a (1 - new_weight) y agregar candidato
-    w_after = pf.set_index("Ticker")["Weight"].copy()
-    w_after = w_after * (1 - new_weight)
-    w_after = w_after.reindex(rets.columns, fill_value=0.0)
-    if new_ticker in rets.columns:
-        w_after.loc[new_ticker] += new_weight
-    w_after = w_after.values
-    port_after = rets.dot(w_after)
+    # Serie de valor (antes)
+    shares_map = pos.set_index("Ticker")["Shares"].to_dict()
+    aligned = prices.copy()
+    aligned = aligned.reindex(columns=[c for c in aligned.columns if c in shares_map], fill_value=np.nan)
+    for t in aligned.columns:
+        aligned[t] = aligned[t] * shares_map.get(t, 0.0)
+    port_value = aligned.sum(axis=1).dropna()
+    port_ret = port_value.pct_change().dropna()
 
-    # Métricas simples
+    # Agregar candidato (después)
+    shares_map_after = shares_map.copy()
+    shares_map_after[new_ticker] = shares_map_after.get(new_ticker, 0.0) + shares_new
+    aligned_after = prices.copy()
+    aligned_after = aligned_after.reindex(columns=[c for c in aligned_after.columns if c in shares_map_after], fill_value=np.nan)
+    for t in aligned_after.columns:
+        aligned_after[t] = aligned_after[t] * shares_map_after.get(t, 0.0)
+    port_value_after = aligned_after.sum(axis=1).dropna()
+    port_ret_after = port_value_after.pct_change().dropna()
+
     def ann_stats(r):
+        if r.empty: return np.nan, np.nan, np.nan, pd.Series(dtype=float), np.nan
         mu = (1 + r.mean())**252 - 1
         sigma = r.std() * np.sqrt(252)
         sharpe = (mu - rf) / sigma if sigma > 0 else np.nan
@@ -626,59 +719,50 @@ elif menu == "Evaluar nueva acción (básico)":
         mdd = max_drawdown(cum)
         return mu, sigma, sharpe, cum, mdd
 
-    mu_b, sig_b, sh_b, cum_b, mdd_b = ann_stats(port_base)
-    mu_a, sig_a, sh_a, cum_a, mdd_a = ann_stats(port_after)
+    mu_b, sig_b, sh_b, cum_b, mdd_b = ann_stats(port_ret)
+    mu_a, sig_a, sh_a, cum_a, mdd_a = ann_stats(port_ret_after)
 
-    # Correlación candidato vs. base (si existe el ticker)
-    corr_candidate = np.nan
-    if new_ticker in rets.columns:
-        corr_candidate = np.corrcoef(rets[new_ticker].reindex(port_base.index, fill_value=np.nan).dropna(),
-                                     port_base.reindex(rets.index, fill_value=np.nan).dropna())[0,1]
-
-    # Reglas simples de decisión (semáforo)
+    # Reglas simples
     delta_sharpe = (sh_a - sh_b) if (not np.isnan(sh_a) and not np.isnan(sh_b)) else np.nan
-    delta_mdd = (mdd_a - mdd_b) if (not np.isnan(mdd_a) and not np.isnan(mdd_b)) else np.nan  # más negativo = peor
+    delta_mdd = (mdd_a - mdd_b) if (not np.isnan(mdd_a) and not np.isnan(mdd_b)) else np.nan
+    corr_candidate = np.nan
+    if new_ticker in prices.columns:
+        cand_ret = prices[new_ticker].pct_change().dropna()
+        corr_candidate = np.corrcoef(
+            cand_ret.reindex(port_ret.index).dropna(),
+            port_ret.reindex(cand_ret.index).dropna()
+        )[0,1] if not port_ret.empty else np.nan
 
-    decision = "Considerar"
-    badge_class = "badge-yellow"
-    motivo = []
-
-    # Criterios básicos (ajústalos si quieres)
+    decision = "Considerar"; badge_class = "badge-yellow"; motivo = []
     cond_verde = (delta_sharpe >= 0.03) and (delta_mdd >= -0.02) and (np.isnan(corr_candidate) or corr_candidate <= 0.75)
     cond_rojo  = (np.isnan(delta_sharpe) or delta_sharpe <= 0.0)
 
     if cond_verde:
-        decision = "Agregar"
-        badge_class = "badge-green"
-        motivo.append("Mejora el Sharpe del portafolio y no empeora significativamente el drawdown.")
-        if not np.isnan(corr_candidate) and corr_candidate <= 0.75:
-            motivo.append("Aporta diversificación (correlación moderada/baja).")
+        decision = "Agregar"; badge_class = "badge-green"
+        motivo.append("Mejora el Sharpe y no empeora significativamente el drawdown.")
     elif cond_rojo:
-        decision = "No agregar"
-        badge_class = "badge-red"
+        decision = "No agregar"; badge_class = "badge-red"
         motivo.append("No mejora el Sharpe del portafolio.")
-        if delta_mdd < -0.03:
-            motivo.append("Empeora el drawdown de forma relevante.")
 
     st.markdown(f'**Recomendación:** <span class="badge {badge_class}">{decision}</span>', unsafe_allow_html=True)
     with st.expander("Ver resumen"):
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Δ Sharpe", f'{(delta_sharpe if not np.isnan(delta_sharpe) else 0):+.2f}')
         c2.metric("Δ Volatilidad", f'{(sig_a - sig_b)*100:+.2f}%')
-        c3.metric("Δ Max Drawdown", f'{(mdd_a - mdd_b)*100:+.2f}%')
-        c4.metric("Correlación candidato", f'{corr_candidate:.2f}' if not np.isnan(corr_candidate) else "N/A")
-        if motivo:
-            st.write("- " + "\n- ".join(motivo))
+        c3.metric("Δ Max Drawdown", f'{(delta_mdd if not np.isnan(delta_mdd) else 0)*100:+.2f}%')
+        c4.metric("Correlación cand.", f'{corr_candidate:.2f}' if not np.isnan(corr_candidate) else "N/A")
+        if motivo: st.write("- " + "\n- ".join(motivo))
 
-    # Gráfico comparativo simple
     fig_comp = go.Figure()
-    fig_comp.add_trace(go.Scatter(x=cum_b.index, y=cum_b.values, mode="lines", name="Portafolio (antes)"))
-    fig_comp.add_trace(go.Scatter(x=cum_a.index, y=cum_a.values, mode="lines", name="Portafolio (después)"))
-    if new_ticker in rets.columns:
-        cum_new = (1 + rets[new_ticker]).cumprod()
+    if not cum_b.empty:
+        fig_comp.add_trace(go.Scatter(x=cum_b.index, y=cum_b.values, mode="lines", name="Portafolio (antes)"))
+    if not cum_a.empty:
+        fig_comp.add_trace(go.Scatter(x=cum_a.index, y=cum_a.values, mode="lines", name="Portafolio (después)"))
+    if new_ticker in prices.columns:
+        cum_new = (1 + prices[new_ticker].pct_change().dropna()).cumprod()
         fig_comp.add_trace(go.Scatter(x=cum_new.index, y=cum_new.values, mode="lines", name=new_ticker, line=dict(dash="dot")))
     fig_comp.update_layout(title="Crecimiento de $1: antes vs. después", template=TEMPLATE,
-                           xaxis_title="", yaxis_title="Crecimiento de $1", height=460)
+                           xaxis_title="", yaxis_title="Crecimiento de $1", height=420)
     st.plotly_chart(fig_comp, use_container_width=True)
 
 # =========================================================
@@ -703,7 +787,6 @@ elif menu == "Riesgo de Inversión":
     else:
         s_ret, _, _ = return_metrics(df_stock)
         m_ret, _, _ = return_metrics(df_market)
-
         beta, alpha = compute_beta_alpha(s_ret["Return"], m_ret["Return"])
         var_market = m_ret["Return"].var()
 
