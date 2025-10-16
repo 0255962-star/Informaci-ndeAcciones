@@ -6,4 +6,4 @@ requests
 yfinance
 gspread==6.*
 google-auth==2.*
-google-auth-oauthlib==1.*
+google-auth-oauthlib==1.*   # opcional, pero útil
