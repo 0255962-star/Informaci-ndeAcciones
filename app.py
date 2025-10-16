@@ -12,7 +12,7 @@ from datetime import date
 # =====================================================
 # CONFIGURACIÓN INICIAL
 # =====================================================
-st.set_page_config(page_title="Modelo Financiero Huizar", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Consulta de Acciones", page_icon="📊", layout="wide")
 
 st.sidebar.title("📘 Menú de Finanzas")
 menu = st.sidebar.radio(
@@ -98,7 +98,7 @@ def load_prices(tickers, period="1y"):
 # 1️⃣ CONSULTA DE ACCIONES
 # =====================================================
 if menu == "📊 Consulta de Acciones":
-    st.title("📊 Consulta de Acciones - MODELO FINANCIERO HUIZAR")
+    st.title("📊 Consulta de Acciones")
     st.write("Visualiza información general, descripción y gráficos interactivos de la empresa.")
 
     st.write("---")
