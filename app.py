@@ -25,6 +25,9 @@ h1 { margin-bottom: 0.25rem; }
 .sidebar-title { font-weight: 700; font-size: 1.1rem; margin-top: 0.5rem; }
 .small { color:#6b7280; font-size:0.92rem; }
 .stTextInput>div>div>input, .stNumberInput input, .stSelectbox>div>div>div { border-radius: 8px; }
+.stat-label { color:#6b7280; font-size:0.85rem; margin-bottom: 0.15rem; }
+.stat-value { font-weight:700; font-size:1.1rem; }
+.card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:12px; height:92px; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -37,7 +40,6 @@ menu = st.sidebar.radio(
     "Selecciona una sección:",
     [
         "Consulta de Acciones",
-        "Tasas de Retorno",
         "Riesgo de Inversión",
         "CAPM",
         "Optimización de Portafolio (Markowitz)",
@@ -131,31 +133,49 @@ def compute_beta_alpha(stock_returns: pd.Series, market_returns: pd.Series):
     return beta, alpha
 
 # =====================================================
+# FORMATEADORES PARA MÉTRICAS (10 datos clave)
+# =====================================================
+def human_number(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "N/A"
+    absn = abs(n)
+    if absn >= 1e12:  return f"{n/1e12:.2f}T"
+    if absn >= 1e9:   return f"{n/1e9:.2f}B"
+    if absn >= 1e6:   return f"{n/1e6:.2f}M"
+    if absn >= 1e3:   return f"{n/1e3:.2f}K"
+    return f"{n:.2f}"
+
+def pct(x):
+    try:
+        return f"{float(x)*100:.2f}%"
+    except Exception:
+        return "N/A"
+
+def ratio(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return "N/A"
+
+# =====================================================
 # ESTILO DE GRÁFICAS
 # =====================================================
 TEMPLATE = "simple_white"
-COLOR_UP = "rgba(22,163,74,1)"       # verde
+COLOR_UP = "rgba(22,163,74,1)"
 COLOR_UP_FILL = "rgba(22,163,74,0.9)"
-COLOR_DOWN = "rgba(220,38,38,1)"     # rojo
+COLOR_DOWN = "rgba(220,38,38,1)"
 COLOR_DOWN_FILL = "rgba(220,38,38,0.9)"
 SMA_COLORS = {"SMA20": "#5546d6", "SMA50": "#f59e0b", "SMA200": "#b78d0a"}
 
 def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show_sma50=True, show_sma200=True):
-    """
-    Candlestick + volumen con mejores prácticas:
-    - Rango de tiempo configurable
-    - Range breaks (oculta fines de semana)
-    - Range selector + slider
-    - Hover unificado
-    - Trazas SMA opcionales
-    """
     df = df.copy()
     df.index = pd.to_datetime(df.index)
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.05, row_heights=[0.72, 0.28])
 
-    # Candles
     fig.add_trace(
         go.Candlestick(
             x=df.index,
@@ -166,7 +186,6 @@ def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show
             increasing_fillcolor=COLOR_UP_FILL,
             decreasing_line_color=COLOR_DOWN,
             decreasing_fillcolor=COLOR_DOWN_FILL,
-            # cuerpo/mecha más visibles
             line=dict(width=1.2),
             whiskerwidth=0.5,
             showlegend=True,
@@ -175,7 +194,6 @@ def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show
         row=1, col=1
     )
 
-    # SMAs (opcionales)
     if show_sma20 and "SMA20" in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], mode="lines",
                                  line=dict(color=SMA_COLORS["SMA20"], width=1.6),
@@ -189,12 +207,10 @@ def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show
                                  line=dict(color=SMA_COLORS["SMA200"], width=1.6),
                                  name="SMA200"), row=1, col=1)
 
-    # Volumen coloreado por dirección
     vol_colors = [COLOR_UP_FILL if c >= o else COLOR_DOWN_FILL for o, c in zip(df["Open"], df["Close"])]
     fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vol_colors,
                          name="Volumen", opacity=0.85), row=2, col=1)
 
-    # Ejes y layout
     fig.update_xaxes(
         showgrid=False,
         rangeslider=dict(visible=True),
@@ -208,14 +224,12 @@ def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show
                 dict(step="all", label="All"),
             ]
         ),
-        rangebreaks=[
-            dict(bounds=["sat", "mon"])  # oculta fines de semana
-        ],
+        rangebreaks=[dict(bounds=["sat", "mon"])],
         row=1, col=1
     )
     fig.update_xaxes(showgrid=False, rangebreaks=[dict(bounds=["sat", "mon"])], row=2, col=1)
 
-    fig.update_yaxes(showgrid=True, zeroline=False, ticksuffix="", row=1, col=1)
+    fig.update_yaxes(showgrid=True, zeroline=False, row=1, col=1)
     fig.update_yaxes(title_text="Volumen", showgrid=True, zeroline=False, row=2, col=1)
 
     fig.update_layout(
@@ -230,11 +244,11 @@ def plot_candles_with_volume(df: pd.DataFrame, title: str, show_sma20=True, show
     return fig
 
 # =====================================================
-# 1) CONSULTA DE ACCIONES — Candlestick mejorado
+# 1) CONSULTA DE ACCIONES (con 10 datos clave)
 # =====================================================
 if menu == "Consulta de Acciones":
     st.markdown("<h1>Consulta de Acciones</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Información de la empresa y gráfica de velas profesional.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Ficha ejecutiva del ticker y gráfica de velas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c0, c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1, 1.2])
@@ -249,19 +263,42 @@ if menu == "Consulta de Acciones":
     with c4:
         show_sma200 = st.checkbox("SMA200", value=False)
 
-    # Información básica
     ticker = yf.Ticker(stonk)
     info = ticker.info if hasattr(ticker, "info") else {}
-    st.subheader("Empresa")
-    st.write(info.get("longName", "No disponible"))
 
-    st.subheader("Descripción (inglés)")
-    st.write(info.get("longBusinessSummary", "No disponible."))
+    # 10 datos clave (con fallback)
+    key_data = {
+        "Sector": info.get("sector", "N/A"),
+        "Industria": info.get("industry", "N/A"),
+        "País": info.get("country", "N/A"),
+        "Market Cap": human_number(info.get("marketCap")),
+        "Beta (5y mensual)": ratio(info.get("beta")),
+        "P/E (Trailing)": ratio(info.get("trailingPE")),
+        "P/E (Forward)": ratio(info.get("forwardPE")),
+        "P/B": ratio(info.get("priceToBook")),
+        "Dividend Yield": pct(info.get("dividendYield")),
+        "Cambio 52 semanas": pct(info.get("52WeekChange")),
+    }
+
+    # Grid 2x5
+    st.subheader("Indicadores clave")
+    cols_top = st.columns(5)
+    cols_bottom = st.columns(5)
+    keys = list(key_data.keys())
+    for i, col in enumerate(cols_top):
+        label = keys[i]
+        val = key_data[label]
+        with col:
+            st.markdown(f'<div class="card"><div class="stat-label">{label}</div><div class="stat-value">{val}</div></div>', unsafe_allow_html=True)
+    for i, col in enumerate(cols_bottom, start=5):
+        label = keys[i]
+        val = key_data[label]
+        with col:
+            st.markdown(f'<div class="card"><div class="stat-label">{label}</div><div class="stat-value">{val}</div></div>', unsafe_allow_html=True)
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     st.subheader("Gráfica de velas con volumen")
 
-    # === FIX: nueva descarga más robusta ===
     period, interval = range_to_yf_params(range_key)
     try:
         hist = ticker.history(period=period, interval=interval, auto_adjust=False)
@@ -269,63 +306,21 @@ if menu == "Consulta de Acciones":
         hist = pd.DataFrame()
         st.error(f"Error al obtener datos: {e}")
 
-    # === Validación robusta ===
     required_cols = {"Open", "High", "Low", "Close", "Volume"}
     if hist.empty or not required_cols.issubset(hist.columns):
         st.warning("No se pudo obtener información histórica suficiente. Intenta con otro rango o símbolo válido.")
     else:
-        # Relleno si hay valores NaN
         hist = hist.dropna(subset=["Open", "High", "Low", "Close"]).copy()
         hist = add_smas(hist, (20, 50, 200))
-
-        # Gráfica
         title = f"{stonk} · {range_key}"
         fig = plot_candles_with_volume(
-            hist,
-            title,
-            show_sma20=show_sma20,
-            show_sma50=show_sma50,
-            show_sma200=show_sma200
+            hist, title,
+            show_sma20=show_sma20, show_sma50=show_sma50, show_sma200=show_sma200
         )
         st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# 2) TASAS DE RETORNO
-# =====================================================
-elif menu == "Tasas de Retorno":
-    st.markdown("<h1>Tasas de Retorno</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Rendimientos simples, logarítmicos y métricas anualizadas.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        stonk = st.text_input("Símbolo", "AAPL").upper()
-    with c2:
-        range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
-
-    period, interval = range_to_yf_params(range_key)
-    df = get_history(stonk, period, interval)
-
-    if df.empty:
-        st.warning("No se pudo obtener información.")
-    else:
-        df_ret, ann_ret, ann_vol = return_metrics(df)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Rendimiento anualizado", f"{ann_ret*100:.2f}%")
-        with c2:
-            st.metric("Volatilidad anualizada", f"{ann_vol*100:.2f}%")
-
-        st.subheader("Retornos diarios")
-        st.line_chart(df_ret["Return"])
-
-        st.subheader("Retornos acumulados")
-        cumulative = (1 + df_ret["Return"]).cumprod() - 1
-        st.area_chart(cumulative)
-
-# =====================================================
-# 3) RIESGO DE INVERSIÓN
+# 2) RIESGO DE INVERSIÓN
 # =====================================================
 elif menu == "Riesgo de Inversión":
     st.markdown("<h1>Riesgo de Inversión</h1>", unsafe_allow_html=True)
@@ -365,7 +360,7 @@ elif menu == "Riesgo de Inversión":
         st.scatter_chart(pd.DataFrame({"Stock": s_ret["Return"], "Market": m_ret["Return"]}).dropna())
 
 # =====================================================
-# 4) CAPM
+# 3) CAPM
 # =====================================================
 elif menu == "CAPM":
     st.markdown("<h1>CAPM</h1>", unsafe_allow_html=True)
@@ -414,11 +409,11 @@ elif menu == "CAPM":
                              mode="markers+text", text=["Tu activo"], textposition="bottom center",
                              marker=dict(size=10, color="red"), name="Activo"))
     fig.update_layout(title="Security Market Line (SML)", xaxis_title="Beta", yaxis_title="Rendimiento esperado",
-                      template=TEMPLATE, height=520, margin=dict(l=40, r=20, t=40, b=30))
+                      template="simple_white", height=520, margin=dict(l=40, r=20, t=40, b=30))
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# 5) MARKOWITZ
+# 4) MARKOWITZ
 # =====================================================
 elif menu == "Optimización de Portafolio (Markowitz)":
     st.markdown("<h1>Optimización de Portafolio (Markowitz)</h1>", unsafe_allow_html=True)
@@ -489,12 +484,12 @@ elif menu == "Optimización de Portafolio (Markowitz)":
             title=f"Frontera Eficiente · {range_key}",
             xaxis_title="Riesgo (desv. estándar anualizada)",
             yaxis_title="Rendimiento esperado anualizado",
-            template=TEMPLATE, height=620, margin=dict(l=40, r=20, t=48, b=30)
+            template="simple_white", height=620, margin=dict(l=40, r=20, t=48, b=30)
         )
         st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# 6) MONTE CARLO
+# 5) MONTE CARLO
 # =====================================================
 elif menu == "Simulación Monte Carlo":
     st.markdown("<h1>Simulación Monte Carlo</h1>", unsafe_allow_html=True)
@@ -538,7 +533,7 @@ elif menu == "Simulación Monte Carlo":
         fig.update_layout(
             title=f"Simulación Monte Carlo de {stonk} · μ={ann_ret:.2%}, σ={ann_vol:.2%} · {range_key}",
             xaxis_title="Días", yaxis_title="Precio simulado",
-            template=TEMPLATE, height=680, margin=dict(l=40, r=20, t=48, b=30)
+            template="simple_white", height=680, margin=dict(l=40, r=20, t=48, b=30)
         )
         st.plotly_chart(fig, use_container_width=True)
 
