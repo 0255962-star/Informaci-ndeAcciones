@@ -13,29 +13,54 @@ from plotly.subplots import make_subplots
 # =====================================================
 st.set_page_config(page_title="Consulta de Acciones", page_icon="📊", layout="wide")
 
-st.sidebar.title("📘 Menú de Finanzas")
+# ---- Estilos (CSS) para un look más profesional ----
+CUSTOM_CSS = """
+<style>
+/* ancho máximo del contenido */
+.main .block-container {max-width: 1200px; padding-top: 1rem; padding-bottom: 2rem;}
+/* títulos */
+h1, h2, h3 { font-weight: 700; letter-spacing: -0.2px; }
+h1 { margin-bottom: 0.25rem; }
+.section-subtitle { color: #6b7280; margin-bottom: 1.25rem; }
+/* separadores finos */
+.hr { border: none; border-top: 1px solid #e5e7eb; margin: 1.25rem 0; }
+/* sidebar */
+.css-1d391kg, .stSidebar { border-right: 1px solid #e5e7eb; }
+.sidebar-title { font-weight: 700; font-size: 1.1rem; margin-top: 0.5rem; }
+.small { color:#6b7280; font-size:0.92rem; }
+label[for^="radio-"], label[for^="selectbox-"] { font-weight: 500; }
+/* tablas */
+.dataframe td, .dataframe th { font-size: 0.95rem; }
+/* inputs */
+.stTextInput>div>div>input, .stNumberInput input, .stSelectbox>div>div>div {
+  border-radius: 8px;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# =====================================================
+# SIDEBAR
+# =====================================================
+st.sidebar.markdown('<div class="sidebar-title">Menú</div>', unsafe_allow_html=True)
 menu = st.sidebar.radio(
     "Selecciona una sección:",
     [
-        "📊 Consulta de Acciones",
-        "📈 Tasas de Retorno",
-        "📉 Riesgo de Inversión",
-        "📘 CAPM",
-        "📈 Optimización de Portafolio (Markowitz)",
-        "🎲 Simulación Monte Carlo",
+        "Consulta de Acciones",
+        "Tasas de Retorno",
+        "Riesgo de Inversión",
+        "CAPM",
+        "Optimización de Portafolio (Markowitz)",
+        "Simulación Monte Carlo",
     ]
 )
 
 # =====================================================
-# SELECTOR DE PERIODO (para TODAS las gráficas)
+# SELECTOR DE PERIODO (global)
 # =====================================================
 RANGE_OPTIONS = ["1 semana", "1 mes", "6 meses", "1 año", "YTD", "3 años", "5 años"]
 
 def range_to_yf_params(range_key: str):
-    """
-    Devuelve (period, interval) compatibles con yfinance.
-    Usamos interval mayor para periodos largos para aligerar y hacer más legible.
-    """
     mapping = {
         "1 semana": ("7d", "1d"),
         "1 mes": ("1mo", "1d"),
@@ -48,14 +73,10 @@ def range_to_yf_params(range_key: str):
     return mapping.get(range_key, ("6mo", "1d"))
 
 # =====================================================
-# FUNCIONES AUXILIARES
+# HELPERS DE DATOS
 # =====================================================
 @st.cache_data(ttl=3600)
 def get_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """
-    Descarga histórico OHLCV (auto_adjust=True).
-    Devuelve DataFrame indexado por fecha con columnas: Open, High, Low, Close, Volume.
-    """
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -68,9 +89,6 @@ def add_smas(df: pd.DataFrame, windows=(20, 50, 200)) -> pd.DataFrame:
     return out
 
 def return_metrics(df: pd.DataFrame):
-    """
-    Calcula retornos simple y log, rendimiento y volatilidad anualizados.
-    """
     d = df.copy()
     d["Return"] = d["Close"].pct_change()
     d["LogReturn"] = np.log(d["Close"] / d["Close"].shift(1))
@@ -82,10 +100,6 @@ def return_metrics(df: pd.DataFrame):
 
 @st.cache_data(ttl=1800)
 def load_prices(tickers, period="1y", interval="1d") -> pd.DataFrame:
-    """
-    Devuelve precios de CIERRE ajustado por ticker (columnas=tickers).
-    Soporta 1+ tickers y distintas formas de salida de yfinance.
-    """
     if isinstance(tickers, str):
         tickers = [tickers]
     tickers = [t for t in tickers if t]
@@ -98,17 +112,14 @@ def load_prices(tickers, period="1y", interval="1d") -> pd.DataFrame:
         return pd.DataFrame()
 
     if isinstance(raw.columns, pd.MultiIndex):
-        # Multi-ticker
         if "Close" in raw.columns.levels[0]:
             prices = raw["Close"].copy()
         elif "Adj Close" in raw.columns.levels[0]:
             prices = raw["Adj Close"].copy()
         else:
-            # Primer nivel disponible (defensivo)
             first = raw.columns.levels[0][0]
             prices = raw[first].copy()
     else:
-        # Un ticker
         if "Close" in raw.columns:
             prices = raw[["Close"]].copy()
         elif "Adj Close" in raw.columns:
@@ -130,32 +141,41 @@ def compute_beta_alpha(stock_returns: pd.Series, market_returns: pd.Series):
     return beta, alpha
 
 # =====================================================
-# 1️⃣ CONSULTA DE ACCIONES
+# PALETA/ESTILO DE GRAFICACIÓN
 # =====================================================
-if menu == "📊 Consulta de Acciones":
-    st.title("📊 Consulta de Acciones")
-    st.write("Visualiza información general, descripción y gráficos interactivos de la empresa.")
+TEMPLATE = "simple_white"
+COLOR_UP = "rgba(16,130,59,1)"
+COLOR_UP_FILL = "rgba(16,130,59,0.9)"
+COLOR_DOWN = "rgba(200,30,30,1)"
+COLOR_DOWN_FILL = "rgba(200,30,30,0.9)"
+SMA_COLORS = {"SMA20": "#6C5CE7", "SMA50": "#F39C12", "SMA200": "#B7950B"}
 
-    st.write("---")
+# =====================================================
+# 1) CONSULTA DE ACCIONES
+# =====================================================
+if menu == "Consulta de Acciones":
+    st.markdown("<h1>Consulta de Acciones</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Visualiza información general, descripción y gráficos interactivos.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
     c1, c2 = st.columns([2, 1])
     with c1:
-        stonk = st.text_input("Símbolo de la acción (ej. MSFT, AAPL, NVDA, TSLA)", "MSFT").strip().upper()
+        stonk = st.text_input("Símbolo", "MSFT").strip().upper()
     with c2:
         range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("6 meses"))
 
-    # Info de la empresa
     ticker = yf.Ticker(stonk)
     info = ticker.info if hasattr(ticker, "info") else {}
 
-    st.subheader("🏢 Nombre de la empresa")
+    st.subheader("Empresa")
     st.write(info.get("longName", "No disponible"))
 
-    st.subheader("📝 Descripción del negocio (inglés)")
+    st.subheader("Descripción (inglés)")
     st.write(info.get("longBusinessSummary", "No disponible."))
 
-    # Gráfica
-    st.write("---")
-    st.subheader("📈 Gráfica de Velas con Volumen")
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    st.subheader("Gráfica de velas con volumen")
+
     period, interval = range_to_yf_params(range_key)
     hist = get_history(stonk, period, interval)
 
@@ -165,39 +185,48 @@ if menu == "📊 Consulta de Acciones":
         hist_sma = add_smas(hist, (20, 50, 200))
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.7, 0.3])
+                            vertical_spacing=0.05, row_heights=[0.70, 0.30])
 
         fig.add_trace(go.Candlestick(
             x=hist_sma.index, open=hist_sma["Open"], high=hist_sma["High"],
             low=hist_sma["Low"], close=hist_sma["Close"], name="OHLC",
-            increasing_line_color="rgb(16,130,59)", increasing_fillcolor="rgba(16,130,59,0.9)",
-            decreasing_line_color="rgb(200,30,30)", decreasing_fillcolor="rgba(200,30,30,0.9)",
+            increasing_line_color=COLOR_UP, increasing_fillcolor=COLOR_UP_FILL,
+            decreasing_line_color=COLOR_DOWN, decreasing_fillcolor=COLOR_DOWN_FILL,
             line=dict(width=1.25), whiskerwidth=0.3
         ), row=1, col=1)
 
-        for col, color in zip(["SMA20", "SMA50", "SMA200"], ["#c218f0", "#ff9900", "#c0b000"]):
-            fig.add_trace(go.Scatter(x=hist_sma.index, y=hist_sma[col], mode="lines",
-                                     line=dict(color=color, width=1.5), name=col), row=1, col=1)
+        for k, col in SMA_COLORS.items():
+            if k in hist_sma.columns:
+                fig.add_trace(
+                    go.Scatter(x=hist_sma.index, y=hist_sma[k], mode="lines",
+                               line=dict(color=col, width=1.4), name=k),
+                    row=1, col=1
+                )
 
-        colors = ["rgba(22,163,74,0.75)" if c >= o else "rgba(220,38,38,0.75)"
-                  for o, c in zip(hist_sma["Open"], hist_sma["Close"])]
+        vol_colors = [COLOR_UP_FILL if c >= o else COLOR_DOWN_FILL for o, c in zip(hist_sma["Open"], hist_sma["Close"])]
         fig.add_trace(go.Bar(x=hist_sma.index, y=hist_sma["Volume"],
-                             marker_color=colors, name="Volumen"), row=2, col=1)
+                             marker_color=vol_colors, name="Volumen", opacity=0.85), row=2, col=1)
 
-        fig.update_layout(height=750, title=f"{stonk} · {range_key}",
-                          xaxis_rangeslider_visible=True, template="plotly_white")
+        fig.update_layout(
+            title=f"{stonk} · {range_key}",
+            template=TEMPLATE, height=740,
+            margin=dict(l=40, r=20, t=48, b=30),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            xaxis_rangeslider_visible=True
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# 2️⃣ TASAS DE RETORNO
+# 2) TASAS DE RETORNO
 # =====================================================
-elif menu == "📈 Tasas de Retorno":
-    st.title("📈 Cálculo de Tasas de Retorno")
-    st.write("Calcula **rendimientos simples, logarítmicos y anualizados** de una acción.")
+elif menu == "Tasas de Retorno":
+    st.markdown("<h1>Tasas de Retorno</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Rendimientos simples, logarítmicos y métricas anualizadas.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        stonk = st.text_input("Símbolo de la acción", "AAPL").upper()
+        stonk = st.text_input("Símbolo", "AAPL").upper()
     with c2:
         range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
 
@@ -211,29 +240,30 @@ elif menu == "📈 Tasas de Retorno":
 
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("📈 Rendimiento anualizado", f"{ann_ret*100:.2f}%")
+            st.metric("Rendimiento anualizado", f"{ann_ret*100:.2f}%")
         with c2:
-            st.metric("📉 Volatilidad anualizada", f"{ann_vol*100:.2f}%")
+            st.metric("Volatilidad anualizada", f"{ann_vol*100:.2f}%")
 
-        st.subheader("📊 Retornos diarios")
+        st.subheader("Retornos diarios")
         st.line_chart(df_ret["Return"])
 
-        st.subheader("📊 Retornos acumulados")
+        st.subheader("Retornos acumulados")
         cumulative = (1 + df_ret["Return"]).cumprod() - 1
         st.area_chart(cumulative)
 
 # =====================================================
-# 3️⃣ RIESGO DE INVERSIÓN
+# 3) RIESGO DE INVERSIÓN
 # =====================================================
-elif menu == "📉 Riesgo de Inversión":
-    st.title("📉 Análisis de Riesgo y Volatilidad")
-    st.write("Calcula **desviación estándar, varianza, beta y alpha** frente a un índice.")
+elif menu == "Riesgo de Inversión":
+    st.markdown("<h1>Riesgo de Inversión</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Beta, alpha y varianza vs. un índice de referencia.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        stonk = st.text_input("Símbolo de la acción", "NVDA").upper()
+        stonk = st.text_input("Símbolo", "NVDA").upper()
     with c2:
-        market = st.text_input("Índice de referencia (ej. ^GSPC, ^IXIC)", "^GSPC").upper()
+        market = st.text_input("Índice de referencia (p. ej. ^GSPC, ^IXIC)", "^GSPC").upper()
     with c3:
         range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
 
@@ -252,27 +282,28 @@ elif menu == "📉 Riesgo de Inversión":
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("📊 Beta", f"{beta:.3f}")
+            st.metric("Beta", f"{beta:.3f}")
         with c2:
-            st.metric("⚙️ Varianza mercado", f"{var_market:.6f}")
+            st.metric("Varianza mercado", f"{var_market:.6f}")
         with c3:
-            st.metric("💡 Alpha", f"{alpha:.4f}")
+            st.metric("Alpha", f"{alpha:.4f}")
 
-        st.subheader("Relación entre rendimientos (acción vs mercado)")
+        st.subheader("Relación de rendimientos (acción vs mercado)")
         st.scatter_chart(pd.DataFrame({"Stock": s_ret["Return"], "Market": m_ret["Return"]}).dropna())
 
 # =====================================================
-# 4️⃣ CAPM (con opción de estimar β desde datos)
+# 4) CAPM
 # =====================================================
-elif menu == "📘 CAPM":
-    st.title("📘 Modelo CAPM - Capital Asset Pricing Model")
-    st.write("Calcula el rendimiento esperado de un activo en función de su **β** y del **premio por riesgo**.")
+elif menu == "CAPM":
+    st.markdown("<h1>CAPM</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Rendimiento esperado en función de β y el premio por riesgo.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     with c1:
         rf = st.number_input("Tasa libre de riesgo (0.04 = 4%)", value=0.04)
     with c2:
-        rm = st.number_input("Rend. esperado del mercado (0.10 = 10%)", value=0.10)
+        rm = st.number_input("Rendimiento esperado del mercado (0.10 = 10%)", value=0.10)
     with c3:
         use_data_beta = st.toggle("Estimar β desde datos", value=False)
 
@@ -281,7 +312,7 @@ elif menu == "📘 CAPM":
         with c1:
             stonk = st.text_input("Ticker del activo", "AAPL").upper()
         with c2:
-            market = st.text_input("Benchmark (ej. ^GSPC)", "^GSPC").upper()
+            market = st.text_input("Benchmark (p. ej. ^GSPC)", "^GSPC").upper()
         with c3:
             range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("3 años"))
         period, interval = range_to_yf_params(range_key)
@@ -300,30 +331,30 @@ elif menu == "📘 CAPM":
         beta = st.number_input("β del activo", value=1.2)
 
     expected_return = rf + beta * (rm - rf)
-    st.metric("📈 Rendimiento esperado (CAPM)", f"{expected_return*100:.2f}%")
+    st.metric("Rendimiento esperado (CAPM)", f"{expected_return*100:.2f}%")
 
-    # Línea SML
     betas = np.linspace(0, 2, 50)
     returns = rf + betas * (rm - rf)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=betas, y=returns, mode="lines", name="Línea SML"))
     fig.add_trace(go.Scatter(x=[beta], y=[expected_return],
                              mode="markers+text", text=["Tu activo"], textposition="bottom center",
-                             marker=dict(size=10, color="red")))
+                             marker=dict(size=10, color="red"), name="Activo"))
     fig.update_layout(title="Security Market Line (SML)", xaxis_title="Beta", yaxis_title="Rendimiento esperado",
-                      template="plotly_white")
+                      template=TEMPLATE, height=520, margin=dict(l=40, r=20, t=40, b=30))
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# 5️⃣ MARKOWITZ (usa el mismo selector de periodo)
+# 5) MARKOWITZ
 # =====================================================
-elif menu == "📈 Optimización de Portafolio (Markowitz)":
-    st.title("📈 Optimización de Portafolio - Modelo de Markowitz")
-    st.write("Calcula la **frontera eficiente** con varios activos usando rendimientos y covarianzas anualizadas.")
+elif menu == "Optimización de Portafolio (Markowitz)":
+    st.markdown("<h1>Optimización de Portafolio (Markowitz)</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Frontera eficiente y portafolio de máximo Sharpe.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c1, c2 = st.columns([3, 1])
     with c1:
-        tickers_input = st.text_input("Introduce tickers separados por comas", "AAPL,MSFT,NVDA")
+        tickers_input = st.text_input("Tickers (separados por comas)", "AAPL,MSFT,NVDA")
         tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
     with c2:
         range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("3 años"))
@@ -332,7 +363,7 @@ elif menu == "📈 Optimización de Portafolio (Markowitz)":
     prices = load_prices(tickers, period=period, interval=interval)
 
     if prices.empty or prices.shape[1] < 2:
-        st.warning("Necesito al menos **2 tickers** con datos para construir la frontera eficiente.")
+        st.warning("Necesito al menos 2 tickers con datos para construir la frontera eficiente.")
     else:
         rets = prices.pct_change().dropna()
         mean_returns = rets.mean() * 252
@@ -365,7 +396,7 @@ elif menu == "📈 Optimización de Portafolio (Markowitz)":
 
         st.markdown(f"**Mejor Sharpe**: {ms_sharpe:.2f} · **Rendimiento**: {ms_ret:.2%} · **Riesgo**: {ms_vol:.2%}")
         st.dataframe(
-            pd.Series(ms_weights, index=tickers, name="Peso óptimo (Máx. Sharpe)").to_frame().T,
+            pd.Series(ms_weights, index=tickers, name="Pesos óptimos (Máx. Sharpe)").to_frame().T,
             use_container_width=True
         )
 
@@ -379,30 +410,31 @@ elif menu == "📈 Optimización de Portafolio (Markowitz)":
         fig.add_trace(go.Scatter(
             x=[ms_vol], y=[ms_ret],
             mode="markers+text", text=["Máx. Sharpe"], textposition="top center",
-            marker=dict(color="red", size=10)
+            marker=dict(color="red", size=10), name="Máx. Sharpe"
         ))
         fig.update_layout(
-            title=f"Frontera Eficiente (Markowitz) · {range_key}",
-            xaxis_title="Riesgo (Desv. estándar anualizada)",
+            title=f"Frontera Eficiente · {range_key}",
+            xaxis_title="Riesgo (desv. estándar anualizada)",
             yaxis_title="Rendimiento esperado anualizado",
-            template="plotly_white", height=600
+            template=TEMPLATE, height=620, margin=dict(l=40, r=20, t=48, b=30)
         )
         st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# 6️⃣ MONTE CARLO (usa el mismo selector para estimar μ y σ)
+# 6) MONTE CARLO
 # =====================================================
-elif menu == "🎲 Simulación Monte Carlo":
-    st.title("🎲 Simulación Monte Carlo")
-    st.write("Simula trayectorias de precios a 1 año con base en retorno y volatilidad anualizados del periodo elegido.")
+elif menu == "Simulación Monte Carlo":
+    st.markdown("<h1>Simulación Monte Carlo</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Trayectorias de precio a 1 año basadas en μ y σ estimados del periodo.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        stonk = st.text_input("Símbolo de la acción a simular", "AAPL").upper()
+        stonk = st.text_input("Símbolo", "AAPL").upper()
     with c2:
         range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("1 año"))
     with c3:
-        simulations = st.slider("N° de simulaciones", 50, 2000, 300, step=50)
+        simulations = st.slider("N.º de simulaciones", 50, 2000, 300, step=50)
 
     period, interval = range_to_yf_params(range_key)
     df = get_history(stonk, period, interval)
@@ -412,7 +444,7 @@ elif menu == "🎲 Simulación Monte Carlo":
     else:
         df_ret, ann_ret, ann_vol = return_metrics(df)
         S0 = df_ret["Close"].iloc[-1]
-        T = 1  # 1 año
+        T = 1
         N = 252
 
         np.random.seed(42)
@@ -428,14 +460,17 @@ elif menu == "🎲 Simulación Monte Carlo":
 
         fig = go.Figure()
         for i in range(simulations):
-            fig.add_trace(go.Scatter(y=price_paths[:, i], mode="lines", line=dict(width=0.7), showlegend=False))
-        fig.update_layout(title=f"Simulación Monte Carlo de {stonk} · μ={ann_ret:.2%}, σ={ann_vol:.2%} · {range_key}",
-                          xaxis_title="Días", yaxis_title="Precio simulado",
-                          template="plotly_white", height=700)
+            fig.add_trace(go.Scatter(y=price_paths[:, i], mode="lines",
+                                     line=dict(width=0.7), showlegend=False))
+        fig.update_layout(
+            title=f"Simulación Monte Carlo de {stonk} · μ={ann_ret:.2%}, σ={ann_vol:.2%} · {range_key}",
+            xaxis_title="Días", yaxis_title="Precio simulado",
+            template=TEMPLATE, height=680, margin=dict(l=40, r=20, t=48, b=30)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
 # FOOTER
 # =====================================================
 st.sidebar.markdown("---")
-st.sidebar.info("Desarrollado por **Alejandro Rodrigo Gascón de Alba** – Ingeniería Financiera UP 💼")
+st.sidebar.markdown('<div class="small">Proyecto académico – Ingeniería Financiera</div>', unsafe_allow_html=True)
