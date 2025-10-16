@@ -14,7 +14,6 @@ from datetime import datetime
 # ===== Google Sheets (Service Account) =====
 from google.oauth2.service_account import Credentials
 import gspread
-from google.auth.transport.requests import AuthorizedSession  # <-- PARCHE
 
 # =========================================================
 # CONFIG GENERAL
@@ -308,7 +307,7 @@ def translate_to_spanish(text: str) -> str:
     return generate_content_rest(base, model, prompt)
 
 # =========================================================
-# GOOGLE SHEETS — conexión y utilidades (parche aplicado)
+# GOOGLE SHEETS — conexión y utilidades (FIX: gspread.authorize)
 # =========================================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -318,8 +317,8 @@ SCOPES = [
 @st.cache_resource
 def get_gs_client():
     """
-    PARCHE: crea el cliente gspread con AuthorizedSession explícita.
-    Evita el error: 'AuthorizedSession' object has no attribute '_auth_request'
+    Fix definitivo: usa gspread.authorize(creds), que crea internamente
+    la AuthorizedSession correcta para lectura/escritura.
     """
     info = st.secrets.get("gcp_service_account", None)
     creds = None
@@ -329,10 +328,7 @@ def get_gs_client():
         creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
     else:
         return None
-
-    session = AuthorizedSession(creds)
-    gc = gspread.Client(auth=creds, session=session)
-    return gc
+    return gspread.authorize(creds)
 
 def parse_spreadsheet_target(text: str):
     if not text: return None, None
@@ -344,7 +340,6 @@ def parse_spreadsheet_target(text: str):
 
 @st.cache_data(ttl=120)
 def open_transactions_ws():
-    """Abre el worksheet de transacciones según secrets (sin UI de claves)."""
     client = get_gs_client()
     if client is None: return None
     target = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
@@ -444,7 +439,7 @@ def delete_ticker_all_rows(ticker: str):
     return True
 
 # =========================================================
-# Clasificación simple de tickers (agrupación)
+# Clasificación simple
 # =========================================================
 TECH_HIGH = {"NVDA","GOOG","GOOGL","META","MSFT","AMZN","TSLA","AMD","AVGO"}
 LOW_VOL = {"KO","PG","JNJ","PEP","COST","WMT","MCD","MRK","HD"}
@@ -458,7 +453,7 @@ def classify_ticker(t: str) -> str:
     return "Otros"
 
 # =========================================================
-# SECCIÓN: CONSULTA DE ACCIONES
+# SECCIONES
 # =========================================================
 if menu == "Consulta de Acciones":
     st.markdown("<h1>Consulta de Acciones</h1>", unsafe_allow_html=True)
@@ -480,7 +475,6 @@ if menu == "Consulta de Acciones":
     ticker = yf.Ticker(stonk)
     info = ticker.info if hasattr(ticker, "info") else {}
 
-    # Descripción al inicio
     st.subheader("Empresa")
     st.write(info.get("longName", "No disponible"))
 
@@ -488,7 +482,6 @@ if menu == "Consulta de Acciones":
     summary = info.get("longBusinessSummary", "No disponible.")
     st.write(summary if summary else "No disponible.")
 
-    # Botón de traducción
     if st.button("Traducir a español"):
         if not API_KEY:
             st.warning("Configura GOOGLE_API_KEY en Secrets para traducir con Gemini.")
@@ -548,15 +541,11 @@ if menu == "Consulta de Acciones":
             use_container_width=True
         )
 
-# =========================================================
-# SECCIÓN: MI PORTAFOLIO (GOOGLE SHEETS, Transactions, CRUD)
-# =========================================================
 elif menu == "Mi Portafolio (Google Sheets)":
     st.markdown("<h1>Mi Portafolio</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Lectura de transacciones, cálculo de pesos por valor de mercado, altas y bajas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    # ---- Formulario: Agregar compra ----
     st.subheader("Agregar compra")
     with st.form("add_trade"):
         c1,c2,c3 = st.columns([1.2,1,1])
@@ -580,26 +569,23 @@ elif menu == "Mi Portafolio (Google Sheets)":
                 notes=at_notes,
             )
             st.success(f"Compra de {at_ticker} guardada en Transactions.")
-            st.cache_data.clear()   # limpia caches de lectura
+            st.cache_data.clear()
         except Exception as e:
             st.error(f"No se pudo guardar la compra: {e}")
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    # ---- Leer transacciones ----
     tx = read_transactions_df()
     if tx.empty:
         st.warning("No se pudieron leer transacciones desde Google Sheets. Verifica secrets/permisos/pestaña 'Transactions'.")
         st.stop()
 
-    # ---- Universo de tickers y precios históricos (5y) ----
     tickers = sorted(tx["Ticker"].unique().tolist())
     prices = load_prices(tickers, period="5y", interval="1d")
     if prices.empty:
         st.error("No se pudieron descargar precios para construir el histórico a 5 años.")
         st.stop()
 
-    # ---- Valor de mercado actual y pesos ----
     last_prices = {t: get_last_close(t) for t in tickers}
     tx["LastPrice"] = tx["Ticker"].map(last_prices)
     tx["MktValue"] = tx["Shares"] * tx["LastPrice"]
@@ -608,7 +594,6 @@ elif menu == "Mi Portafolio (Google Sheets)":
     pos["Weight"] = pos["MktValue"] / total_mv if total_mv > 0 else 0.0
     pos["Grupo"] = pos["Ticker"].apply(classify_ticker)
 
-    # ---- Serie de valor del portafolio (a partir de Shares) ----
     shares_map = pos.set_index("Ticker")["Shares"].to_dict()
     aligned = prices.copy()
     aligned = aligned.reindex(columns=[c for c in aligned.columns if c in shares_map], fill_value=np.nan)
@@ -633,7 +618,6 @@ elif menu == "Mi Portafolio (Google Sheets)":
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    # ---- Gráfico de rendimiento acumulado 5y ----
     port_cum = (1 + port_ret).cumprod()
     fig_perf = go.Figure()
     fig_perf.add_trace(go.Scatter(x=port_cum.index, y=port_cum.values, mode="lines", name="Portafolio (valor)"))
@@ -641,14 +625,12 @@ elif menu == "Mi Portafolio (Google Sheets)":
                            xaxis_title="", yaxis_title="Crecimiento", height=420)
     st.plotly_chart(fig_perf, use_container_width=True)
 
-    # ---- Distribución por grupo ----
     grp = pos.groupby("Grupo", as_index=False)["MktValue"].sum().sort_values("MktValue", ascending=False)
     if not grp.empty:
         fig_grp = go.Figure(data=[go.Pie(labels=grp["Grupo"], values=grp["MktValue"], hole=0.5)])
         fig_grp.update_layout(title="Distribución por grupo (valor de mercado)", template="simple_white", height=380)
         st.plotly_chart(fig_grp, use_container_width=True)
 
-    # ---- Detalle por activo (con botón de eliminar) ----
     st.subheader("Detalle por activo")
     pos_view = pos.copy()
     pos_view["LastPrice"] = pos_view["Ticker"].map(last_prices)
@@ -680,9 +662,6 @@ elif menu == "Mi Portafolio (Google Sheets)":
             except Exception as e:
                 st.error(f"No se pudo eliminar: {e}")
 
-# =========================================================
-# SECCIÓN: EVALUAR NUEVA ACCIÓN (BÁSICO)
-# =========================================================
 elif menu == "Evaluar nueva acción (básico)":
     st.markdown("<h1>Evaluar nueva acción (básico)</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Compara tu portafolio actual vs. agregar un ticker con acciones propuestas.</div>', unsafe_allow_html=True)
@@ -749,16 +728,14 @@ elif menu == "Evaluar nueva acción (básico)":
             port_ret.reindex(cand_ret.index).dropna()
         )[0,1] if not port_ret.empty else np.nan
 
-    decision = "Considerar"; badge_class = "badge-yellow"; motivo = []
+    decision = "Considerar"; badge_class = "badge-yellow"
     cond_verde = (delta_sharpe >= 0.03) and (delta_mdd >= -0.02) and (np.isnan(corr_candidate) or corr_candidate <= 0.75)
     cond_rojo  = (np.isnan(delta_sharpe) or delta_sharpe <= 0.0)
 
     if cond_verde:
         decision = "Agregar"; badge_class = "badge-green"
-        motivo.append("Mejora el Sharpe y no empeora significativamente el drawdown.")
     elif cond_rojo:
         decision = "No agregar"; badge_class = "badge-red"
-        motivo.append("No mejora el Sharpe del portafolio.")
 
     st.markdown(f'**Recomendación:** <span class="badge {badge_class}">{decision}</span>', unsafe_allow_html=True)
     with st.expander("Ver resumen"):
@@ -780,9 +757,6 @@ elif menu == "Evaluar nueva acción (básico)":
                            xaxis_title="", yaxis_title="Crecimiento de $1", height=420)
     st.plotly_chart(fig_comp, use_container_width=True)
 
-# =========================================================
-# SECCIÓN: RIESGO DE INVERSIÓN
-# =========================================================
 elif menu == "Riesgo de Inversión":
     st.markdown("<h1>Riesgo de Inversión</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Beta, alpha y varianza vs. un índice de referencia.</div>', unsafe_allow_html=True)
@@ -813,9 +787,6 @@ elif menu == "Riesgo de Inversión":
         st.subheader("Relación de rendimientos (acción vs mercado)")
         st.scatter_chart(pd.DataFrame({"Stock": s_ret["Return"], "Market": m_ret["Return"]}).dropna())
 
-# =========================================================
-# SECCIÓN: CAPM
-# =========================================================
 elif menu == "CAPM":
     st.markdown("<h1>CAPM</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Rendimiento esperado en función de β y del premio por riesgo.</div>', unsafe_allow_html=True)
@@ -859,9 +830,6 @@ elif menu == "CAPM":
                       template="simple_white", height=520, margin=dict(l=40,r=20,t=40,b=30))
     st.plotly_chart(fig, use_container_width=True)
 
-# =========================================================
-# SECCIÓN: MARKOWITZ
-# =========================================================
 elif menu == "Optimización de Portafolio (Markowitz)":
     st.markdown("<h1>Optimización de Portafolio (Markowitz)</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Frontera eficiente y portafolio de máximo Sharpe (simulación).</div>', unsafe_allow_html=True)
@@ -922,9 +890,6 @@ elif menu == "Optimización de Portafolio (Markowitz)":
                           template="simple_white", height=620, margin=dict(l=40,r=20,t=48,b=30))
         st.plotly_chart(fig, use_container_width=True)
 
-# =========================================================
-# SECCIÓN: MONTE CARLO
-# =========================================================
 elif menu == "Simulación Monte Carlo":
     st.markdown("<h1>Simulación Monte Carlo</h1>", unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Trayectorias de precio a 1 año (GBM) basadas en μ y σ estimados.</div>', unsafe_allow_html=True)
@@ -958,6 +923,5 @@ elif menu == "Simulación Monte Carlo":
                           template="simple_white", height=680, margin=dict(l=40,r=20,t=48,b=30))
         st.plotly_chart(fig, use_container_width=True)
 
-# Footer
 st.sidebar.markdown("---")
 st.sidebar.caption("Proyecto académico – Ingeniería Financiera")
