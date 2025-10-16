@@ -1,11 +1,7 @@
-
----
-
-# config.toml
-```toml
 [server]
 headless = true
 
 [theme]
 base = "light"
 primaryColor = "#0f62fe"
+
