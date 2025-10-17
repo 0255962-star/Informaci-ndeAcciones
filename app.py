@@ -1,8 +1,5 @@
 # App.py — Panel de Finanzas con Google Sheets (Transactions) + Gemini + Plotly
-# Cambios:
-# - Botón Reintentar conexión usa st.rerun()
-# - Worksheet no cacheado; reintento al abrir
-# - Saneado de NaN/Inf al subir a Sheets (evita "Out of range float values are not JSON compliant")
+# Incluye: Equity-only y Asset Mix optimizers (Markowitz) con simulación y restricciones.
 
 import os
 import re
@@ -311,7 +308,8 @@ def translate_to_spanish(text: str) -> str:
     return generate_content_rest(base, model, prompt)
 
 # =========================================================
-# GOOGLE SHEETS — conexión y utilidades (Worksheet NO cacheado)
+# GOOGLE SHEETS — conexión y utilidades
+# (Worksheet NO cacheado; apertura robusta; saneo NaN/Inf)
 # =========================================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -330,32 +328,35 @@ def get_gs_client():
         return None
     return gspread.authorize(creds)
 
-def open_transactions_ws(force_retry: bool = True):
-    """Abre SIEMPRE un worksheet nuevo (no cachea el handle). Reintenta una vez si falla."""
-    def _open():
-        client = get_gs_client()
-        if client is None:
-            return None
-        target = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
-        ws_name = st.secrets.get("GSHEETS_TRANSACTIONS_WS", "Transactions")
-        if not target:
-            return None
-        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", target)
-        if m:
-            sh = client.open_by_key(m.group(1))
-        elif re.fullmatch(r"[A-Za-z0-9\-_]{20,}", target):
-            sh = client.open_by_key(target)
-        else:
-            sh = client.open(target)
-        return sh.worksheet(ws_name)
-
+def open_or_create_transactions_ws():
+    client = get_gs_client()
+    if client is None:
+        return None
+    key = st.secrets.get("GSHEETS_SPREADSHEET_NAME", "").strip()
+    ws_name = st.secrets.get("GSHEETS_TRANSACTIONS_WS", "Transactions").strip() or "Transactions"
+    if not key: return None
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9\-_]+)", key)
+    if m: key = m.group(1)
+    sh = client.open_by_key(key)
     try:
-        return _open()
+        ws = sh.worksheet(ws_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=ws_name, rows=1000, cols=10)
+        ws.update([["Ticker","TradeDate","Shares","Price","Fees","Notes"]])
+    vals = ws.get_all_values()
+    if not vals or [c.strip() for c in vals[0]] != ["Ticker","TradeDate","Shares","Price","Fees","Notes"]:
+        ws.clear()
+        ws.update([["Ticker","TradeDate","Shares","Price","Fees","Notes"]])
+    return ws
+
+def open_transactions_ws(force_retry: bool = True):
+    try:
+        return open_or_create_transactions_ws()
     except Exception:
         if force_retry:
-            st.cache_resource.clear()  # invalida el client cacheado
+            st.cache_resource.clear()
             try:
-                return _open()
+                return open_or_create_transactions_ws()
             except Exception:
                 return None
         return None
@@ -368,7 +369,6 @@ def read_transactions_df() -> pd.DataFrame:
         values = ws.get_all_values()
         if not values:
             return pd.DataFrame()
-
         header_row_idx = None
         for i, row in enumerate(values):
             row_norm = [str(c).strip() for c in row]
@@ -376,29 +376,23 @@ def read_transactions_df() -> pd.DataFrame:
                 header_row_idx = i
                 headers = row_norm
                 break
-
         if header_row_idx is None:
             headers = [str(c).strip() for c in values[0]]
             data_rows = values[1:]
         else:
             data_rows = values[header_row_idx + 1 :]
-
         df = pd.DataFrame(data_rows, columns=headers).replace({"": None})
-
         for col in ["Ticker","TradeDate","Shares","Price","Fees","Notes"]:
             if col not in df.columns:
                 df[col] = None
-
         df["Ticker"] = df["Ticker"].astype(str).str.upper()
         df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce")
         df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce")
         df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
         df["Fees"] = pd.to_numeric(df["Fees"], errors="coerce")
-
         df = df.dropna(subset=["Ticker","Shares"])
         df = df[df["Ticker"] != ""]
         df = df[df["Shares"] > 0]
-
         return df.reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
@@ -407,7 +401,6 @@ def append_transaction_row(ticker: str, trade_date: str, shares: float, price: f
     ws = open_transactions_ws(force_retry=True)
     if ws is None:
         raise RuntimeError("No se pudo abrir la hoja de transacciones. Verifica secrets y permisos.")
-    # normalizar price/fees para JSON
     def norm_num(x):
         if x is None: return ""
         try:
@@ -431,29 +424,23 @@ def append_transaction_row(ticker: str, trade_date: str, shares: float, price: f
         ws.append_row(row, value_input_option="USER_ENTERED")
 
 def overwrite_transactions_df(df: pd.DataFrame):
-    """Reemplaza toda la pestaña 'Transactions' con df, saneando valores para JSON."""
     ws = open_transactions_ws(force_retry=True)
     if ws is None:
         raise RuntimeError("No se pudo abrir la hoja de transacciones.")
-
     cols = ["Ticker", "TradeDate", "Shares", "Price", "Fees", "Notes"]
     out = df.copy()
     for c in cols:
         if c not in out.columns:
             out[c] = ""
-
     out = out[cols].copy()
     out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
-
     out["TradeDate"] = out["TradeDate"].apply(
         lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp)
         else ("" if pd.isna(x) else str(x))
     )
     for c in ["Shares","Price","Fees"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-
     out = out.replace([np.nan, np.inf, -np.inf], "")
-
     ws.clear()
     ws.update([cols] + out.astype(object).values.tolist(), value_input_option="USER_ENTERED")
 
@@ -481,6 +468,110 @@ def classify_ticker(t: str) -> str:
     if t in TECH_HIGH: return "Tecnología (alto beta)"
     if t in LOW_VOL:   return "Defensivo (bajo beta)"
     return "Otros"
+
+# =========================================================
+# UTILIDADES DE PORTAFOLIO
+# =========================================================
+def current_weights_from_tx(tx: pd.DataFrame, universe: list) -> pd.Series:
+    if tx.empty or not universe: return pd.Series(dtype=float)
+    tickers = sorted(set(universe))
+    last_prices = {t: get_last_close(t) for t in tickers}
+    sub = tx[tx["Ticker"].isin(tickers)].copy()
+    if sub.empty: return pd.Series(dtype=float)
+    sub["LastPrice"] = sub["Ticker"].map(last_prices)
+    sub["MktValue"] = sub["Shares"] * sub["LastPrice"]
+    pos = sub.groupby("Ticker", as_index=False)["MktValue"].sum()
+    total = pos["MktValue"].sum()
+    if total <= 0: return pd.Series(dtype=float)
+    w = pos.set_index("Ticker")["MktValue"] / total
+    # Garantiza presencia de todos los tickers del universo (0 si faltan)
+    for t in tickers:
+        if t not in w.index:
+            w.loc[t] = 0.0
+    return w.sort_index()
+
+def prices_for_universe(universe: list, period="3y", interval="1d") -> pd.DataFrame:
+    if not universe: return pd.DataFrame()
+    return load_prices(universe, period=period, interval=interval)
+
+def returns_matrix(prices: pd.DataFrame) -> pd.DataFrame:
+    return prices.pct_change().dropna(how="all").dropna(axis=0, how="any")
+
+def shrink_cov(cov: pd.DataFrame, alpha: float = 0.10) -> pd.DataFrame:
+    """Shrinkage simple hacia la diagonal: Σ_shrink = (1-α)Σ + α·diag(Σ)."""
+    if cov.empty: return cov
+    diag = np.diag(np.diag(cov.values))
+    shrunk = (1 - alpha) * cov.values + alpha * diag
+    return pd.DataFrame(shrunk, index=cov.index, columns=cov.columns)
+
+def simulate_portfolios(mean_ret: pd.Series,
+                        cov: pd.DataFrame,
+                        n_sims: int,
+                        per_asset_min: float,
+                        per_asset_max: float,
+                        group_limits: dict | None,
+                        classes: dict):
+    """
+    Simula portafolios aleatorios (Dirichlet + rechazo) cumpliendo:
+    - Long-only, sum(w)=1
+    - Límites por activo [min,max]
+    - Límites por grupo (dict: {"Tecnología (alto beta)": (min,max), ...})
+    """
+    assets = list(mean_ret.index)
+    A = len(assets)
+    results = []
+    weights_list = []
+    tries = 0
+    max_tries = n_sims * 30  # margen amplio de reintentos
+
+    def valid_groups(w):
+        if not group_limits: return True
+        # suma por grupo
+        gsum = {}
+        for i, a in enumerate(assets):
+            g = classes.get(a, "Otros")
+            gsum[g] = gsum.get(g, 0.0) + w[i]
+        for g,(gmin,gmax) in group_limits.items():
+            if gsum.get(g, 0.0) < gmin - 1e-9 or gsum.get(g, 0.0) > gmax + 1e-9:
+                return False
+        return True
+
+    rng = np.random.default_rng(42)
+    while len(weights_list) < n_sims and tries < max_tries:
+        tries += 1
+        # muestreo Dirichlet (long-only)
+        w = rng.random(A)
+        w = w / w.sum()
+        # aplica límites por activo
+        if np.any(w < per_asset_min - 1e-9) or np.any(w > per_asset_max + 1e-9):
+            continue
+        # aplica límites por grupo
+        if not valid_groups(w):
+            continue
+        # métricas
+        port_ret = float(np.dot(w, mean_ret.values))
+        port_vol = float(np.sqrt(w.T @ cov.values @ w))
+        sharpe = (port_ret - 0.0) / port_vol if port_vol > 0 else np.nan  # rf se aplicará fuera si quieres
+        results.append((port_vol, port_ret, sharpe))
+        weights_list.append(w)
+
+    if not weights_list:
+        return pd.DataFrame(), []
+    res = pd.DataFrame(results, columns=["vol","ret","sharpe"])
+    return res, weights_list
+
+def compare_weights_table(current_w: pd.Series, proposed_w: pd.Series) -> pd.DataFrame:
+    idx = sorted(set(current_w.index) | set(proposed_w.index))
+    out = pd.DataFrame(index=idx, columns=["Actual","Propuesto","Δ (pp)"])
+    out["Actual"] = current_w.reindex(idx).fillna(0.0)
+    out["Propuesto"] = proposed_w.reindex(idx).fillna(0.0)
+    out["Δ (pp)"] = (out["Propuesto"] - out["Actual"]) * 100
+    return (out * 100).round(2)
+
+def turnover_abs(current_w: pd.Series, proposed_w: pd.Series) -> float:
+    a = current_w.reindex(proposed_w.index).fillna(0.0)
+    b = proposed_w.reindex(current_w.index).fillna(0.0)
+    return float(np.abs(a - b).sum() / 2.0)
 
 # =========================================================
 # SECCIONES
@@ -576,11 +667,17 @@ elif menu == "Mi Portafolio (Google Sheets)":
     st.markdown('<div class="section-subtitle">Lectura de transacciones, cálculo de pesos por valor de mercado, altas y bajas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    # Botón para reintentar conexión (reconstruye client y borra caches de datos)
     if st.button("Reintentar conexión a Sheets"):
         st.cache_resource.clear()
         st.cache_data.clear()
-        st.rerun()
+        # Autocorrección básica
+        try:
+            ws = open_or_create_transactions_ws()
+            if ws is not None:
+                st.success("Conexión y pestaña Transactions OK.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Fallo al reconectar: {e}")
 
     st.subheader("Agregar compra")
     with st.form("add_trade"):
@@ -631,6 +728,7 @@ elif menu == "Mi Portafolio (Google Sheets)":
     pos["Weight"] = pos["MktValue"] / total_mv if total_mv > 0 else 0.0
     pos["Grupo"] = pos["Ticker"].apply(classify_ticker)
 
+    # Serie de valor
     shares_map = pos.set_index("Ticker")["Shares"].to_dict()
     aligned = prices.copy()
     aligned = aligned.reindex(columns=[c for c in aligned.columns if c in shares_map], fill_value=np.nan)
@@ -705,7 +803,7 @@ elif menu == "Evaluar nueva acción (básico)":
     st.markdown('<div class="section-subtitle">Compara tu portafolio actual vs. agregar un ticker con acciones propuestas.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    tx = read_transactions_df()  # lectura fresca
+    tx = read_transactions_df()
     if tx.empty:
         st.warning("No hay transacciones en Google Sheets. Agrega compras en la sección 'Mi Portafolio'.")
         st.stop()
@@ -868,63 +966,207 @@ elif menu == "CAPM":
 
 elif menu == "Optimización de Portafolio (Markowitz)":
     st.markdown("<h1>Optimización de Portafolio (Markowitz)</h1>", unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Frontera eficiente y portafolio de máximo Sharpe (simulación).</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Frontera eficiente y portafolios óptimos por simulación con restricciones.</div>', unsafe_allow_html=True)
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-    c1,c2 = st.columns([3,1])
+    tx = read_transactions_df()
+    if tx.empty:
+        st.warning("No hay transacciones en Google Sheets. Ve a “Mi Portafolio” y agrega compras.")
+        st.stop()
+
+    # Parámetros comunes
+    c0,c1,c2,c3 = st.columns([1.2,1,1,1])
+    with c0:
+        period_key = st.selectbox("Ventana de datos", ["1 año","3 años","5 años"], index=1)
     with c1:
-        tickers = [t.strip().upper() for t in st.text_input("Tickers (separados por comas)", "AAPL,MSFT,NVDA").split(",") if t.strip()]
+        obj = st.selectbox("Objetivo", ["Máximo Sharpe","Mínima Varianza"], index=0)
     with c2:
-        range_key = st.selectbox("Periodo", RANGE_OPTIONS, index=RANGE_OPTIONS.index("3 años"))
+        n_sims = st.slider("N.º simulaciones", 1000, 15000, 4000, step=500)
+    with c3:
+        shrink_alpha = st.slider("Shrinkage covarianza (α)", 0.0, 0.5, 0.10, step=0.02)
 
-    period, interval = range_to_yf_params(range_key)
-    prices = load_prices(tickers, period=period, interval=interval)
+    period_map = {"1 año":"1y","3 años":"3y","5 años":"5y"}
+    period = period_map[period_key]
+    interval = "1d"
 
-    if prices.empty or prices.shape[1] < 2:
-        st.warning("Necesito al menos 2 tickers con datos para construir la frontera eficiente.")
-    else:
-        rets = prices.pct_change().dropna()
-        mean_returns = rets.mean() * 252
-        cov_matrix = rets.cov() * 252
+    st.markdown("### Modo A) Optimizar mi portafolio (Equity-only)")
+    st.caption("Optimiza **solo acciones** (excluye ETFs amplios como SPY/VOO/IVV).")
+    ca1, ca2, ca3, ca4 = st.columns(4)
+    with ca1:
+        amin = st.number_input("Mín. por activo (%)", 0.0, 50.0, 2.0, step=0.5)/100
+    with ca2:
+        amax = st.number_input("Máx. por activo (%)", 1.0, 100.0, 15.0, step=1.0)/100
+    with ca3:
+        tech_min = st.number_input("Tech mínimo (%)", 0.0, 100.0, 30.0, step=1.0)/100
+    with ca4:
+        tech_max = st.number_input("Tech máximo (%)", 0.0, 100.0, 50.0, step=1.0)/100
+    cb1, cb2 = st.columns(2)
+    with cb1:
+        defens_min = st.number_input("Defensivo mínimo (%)", 0.0, 100.0, 20.0, step=1.0)/100
+    with cb2:
+        defens_max = st.number_input("Defensivo máximo (%)", 0.0, 100.0, 40.0, step=1.0)/100
 
-        c1,c2 = st.columns(2)
-        with c1: num_portfolios = st.slider("Número de portafolios simulados", 1000, 10000, 3000, step=500)
-        with c2: rf = st.number_input("Tasa libre de riesgo (0.04 = 4%)", value=0.04, step=0.01)
+    if st.button("Optimizar mi Portafolio (Equity-only)"):
+        with st.spinner("Calculando universo, retornos y covarianza..."):
+            # Universo: solo acciones (excluye ETFs)
+            all_tickers = sorted(tx["Ticker"].unique().tolist())
+            equities = [t for t in all_tickers if t.upper() not in INDEX_ETF]
+            if len(equities) < 2:
+                st.warning("Necesito al menos 2 acciones en tu portafolio para optimizar el sleeve de acciones.")
+            else:
+                # Pesos actuales SOLO dentro del sleeve de acciones (normalizados a 1)
+                w_cur = current_weights_from_tx(tx, equities)
+                if w_cur.empty or w_cur.sum() == 0:
+                    st.warning("No pude construir pesos actuales del sleeve de acciones.")
+                else:
+                    prices = prices_for_universe(equities, period=period, interval=interval)
+                    rets = returns_matrix(prices)
+                    if rets.empty or rets.shape[1] < 2:
+                        st.warning("Datos insuficientes para calcular riesgo/retorno de las acciones.")
+                    else:
+                        mean_ret = rets.mean() * 252
+                        cov = rets.cov() * 252
+                        cov = shrink_cov(cov, shrink_alpha)
+                        # Límite por grupos
+                        classes = {a: classify_ticker(a) for a in equities}
+                        group_limits = {
+                            "Tecnología (alto beta)": (tech_min, tech_max),
+                            "Defensivo (bajo beta)": (defens_min, defens_max),
+                        }
+                        res, w_list = simulate_portfolios(mean_ret.loc[equities], cov.loc[equities, equities],
+                                                          n_sims=n_sims,
+                                                          per_asset_min=amin, per_asset_max=amax,
+                                                          group_limits=group_limits, classes=classes)
+                        if res.empty:
+                            st.error("No se generaron portafolios que cumplan las restricciones. Ajusta límites.")
+                        else:
+                            # Selección por objetivo
+                            if obj == "Máximo Sharpe":
+                                idx = np.nanargmax(res["sharpe"].values)
+                            else:
+                                idx = np.nanargmin(res["vol"].values)
+                            w_opt = pd.Series(w_list[idx], index=equities)
+                            w_opt = w_opt / w_opt.sum()
 
-        results = np.zeros((3, num_portfolios))
-        weights_record = []
-        rng = np.random.default_rng(42)
-        for i in range(num_portfolios):
-            w = rng.random(len(tickers)); w /= w.sum()
-            port_ret = float(np.dot(w, mean_returns))
-            port_vol = float(np.sqrt(w.T @ cov_matrix.values @ w))
-            sharpe = (port_ret - rf) / port_vol if port_vol>0 else np.nan
-            results[0,i], results[1,i], results[2,i] = port_vol, port_ret, sharpe
-            weights_record.append(w)
+                            # Métricas y comparación
+                            rf_local = st.number_input("Rf para métricas (Equity-only)", value=0.04, step=0.01, key="rf_eq")
+                            mu_opt = float(np.dot(w_opt.values, mean_ret.loc[equities].values))
+                            vol_opt = float(np.sqrt(w_opt.values @ cov.loc[equities, equities].values @ w_opt.values))
+                            sharpe_opt = (mu_opt - rf_local) / vol_opt if vol_opt > 0 else np.nan
+                            mu_cur = float(np.dot(w_cur.values, mean_ret.loc[equities].reindex(w_cur.index).values))
+                            vol_cur = float(np.sqrt(w_cur.values @ cov.loc[w_cur.index, w_cur.index].values @ w_cur.values))
+                            sharpe_cur = (mu_cur - rf_local) / vol_cur if vol_cur > 0 else np.nan
 
-        max_sharpe_idx = np.nanargmax(results[2])
-        ms_vol, ms_ret, ms_sharpe = results[:, max_sharpe_idx]
-        ms_weights = weights_record[max_sharpe_idx]
+                            c1,c2,c3 = st.columns(3)
+                            c1.metric("Retorno esperado (actual vs óptimo)", f"{mu_cur*100:.2f}% → {mu_opt*100:.2f}%")
+                            c2.metric("Riesgo anualizado (actual vs óptimo)", f"{vol_cur*100:.2f}% → {vol_opt*100:.2f}%")
+                            c3.metric("Sharpe (actual vs óptimo)", f"{sharpe_cur:.2f} → {sharpe_opt:.2f}")
 
-        st.markdown(f"**Mejor Sharpe**: {ms_sharpe:.2f} · **Rendimiento**: {ms_ret:.2%} · **Riesgo**: {ms_vol:.2%}")
-        st.dataframe(pd.Series(ms_weights, index=tickers, name="Pesos óptimos (Máx. Sharpe)").to_frame().T,
-                     use_container_width=True)
+                            # Comparación de pesos (solo acciones; suma 100%)
+                            comp = compare_weights_table(w_cur, w_opt)
+                            st.subheader("Pesos en sleeve de acciones (normalizados a 100%)")
+                            st.dataframe(comp.style.format({"Actual":"{:.2f}%", "Propuesto":"{:.2f}%", "Δ (pp)":"{:.2f}"}),
+                                         use_container_width=True)
+                            st.caption(f"Turnover estimado (acciones): {turnover_abs(w_cur, w_opt)*100:.2f}%")
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=results[0,:], y=results[1,:], mode="markers",
-            marker=dict(color=results[2,:], colorscale="Viridis", showscale=True, colorbar_title="Sharpe"),
-            name="Portafolios simulados",
-            hovertemplate="Riesgo: %{x:.2%}<br>Retorno: %{y:.2%}<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(x=[ms_vol], y=[ms_ret], mode="markers+text",
-                                 text=["Máx. Sharpe"], textposition="top center",
-                                 marker=dict(color="red", size=10), name="Máx. Sharpe"))
-        fig.update_layout(title=f"Frontera Eficiente · {range_key}",
-                          xaxis_title="Riesgo (desv. estándar anualizada)",
-                          yaxis_title="Rendimiento esperado anualizado",
-                          template="simple_white", height=620, margin=dict(l=40,r=20,t=48,b=30))
-        st.plotly_chart(fig, use_container_width=True)
+                            # Frontera simulada
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=res["vol"], y=res["ret"], mode="markers",
+                                marker=dict(color=res["sharpe"], colorscale="Viridis", showscale=True, colorbar_title="Sharpe"),
+                                name="Portafolios simulados",
+                                hovertemplate="Riesgo: %{x:.2%}<br>Retorno: %{y:.2%}<extra></extra>",
+                            ))
+                            fig.add_trace(go.Scatter(x=[vol_cur], y=[mu_cur], mode="markers+text",
+                                                     text=["Actual"], textposition="top center",
+                                                     marker=dict(color="orange", size=10), name="Actual"))
+                            fig.add_trace(go.Scatter(x=[vol_opt], y=[mu_opt], mode="markers+text",
+                                                     text=["Óptimo"], textposition="bottom center",
+                                                     marker=dict(color="red", size=10), name="Óptimo"))
+                            fig.update_layout(title=f"Frontera simulada (Equity-only) · {period_key}",
+                                              xaxis_title="Riesgo (σ anualizado)", yaxis_title="Retorno esperado anualizado",
+                                              template="simple_white", height=520)
+                            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    st.markdown("### Modo B) Optimizar Asset Mix (solo ETFs)")
+    st.caption("Optimiza **solo ETFs** presentes en tus transacciones (p. ej., SPY/QQQ/IWM).")
+
+    etf_min = st.number_input("Mín. por ETF (%)", 0.0, 100.0, 0.0, step=0.5)/100
+    etf_max = st.number_input("Máx. por ETF (%)", 1.0, 100.0, 100.0, step=1.0)/100
+
+    if st.button("Optimizar Asset Mix (ETFs)"):
+        with st.spinner("Evaluando ETFs, retornos y covarianza..."):
+            all_tickers = sorted(tx["Ticker"].unique().tolist())
+            etfs = [t for t in all_tickers if t.upper() in INDEX_ETF]
+            if len(etfs) < 1:
+                st.warning("No encuentro ETFs amplios en tu hoja. Agrega, por ejemplo, SPY o QQQ en 'Mi Portafolio'.")
+            elif len(etfs) < 2:
+                st.warning("Se requieren al menos 2 ETFs para la optimización de mix.")
+            else:
+                w_cur = current_weights_from_tx(tx, etfs)
+                if w_cur.empty or w_cur.sum() == 0:
+                    st.warning("No pude construir pesos actuales de ETFs.")
+                else:
+                    prices = prices_for_universe(etfs, period=period, interval=interval)
+                    rets = returns_matrix(prices)
+                    if rets.empty or rets.shape[1] < 2:
+                        st.warning("Datos insuficientes para calcular riesgo/retorno de los ETFs.")
+                    else:
+                        mean_ret = rets.mean() * 252
+                        cov = rets.cov() * 252
+                        cov = shrink_cov(cov, shrink_alpha)
+                        classes = {a: "Índice/ETF" for a in etfs}
+                        res, w_list = simulate_portfolios(mean_ret.loc[etfs], cov.loc[etfs, etfs],
+                                                          n_sims=n_sims,
+                                                          per_asset_min=etf_min, per_asset_max=etf_max,
+                                                          group_limits=None, classes=classes)
+                        if res.empty:
+                            st.error("No se generaron portafolios que cumplan las restricciones de ETFs. Ajusta límites.")
+                        else:
+                            if obj == "Máximo Sharpe":
+                                idx = np.nanargmax(res["sharpe"].values)
+                            else:
+                                idx = np.nanargmin(res["vol"].values)
+                            w_opt = pd.Series(w_list[idx], index=etfs)
+                            w_opt = w_opt / w_opt.sum()
+
+                            rf_local = st.number_input("Rf para métricas (ETFs)", value=0.04, step=0.01, key="rf_etf")
+                            mu_opt = float(np.dot(w_opt.values, mean_ret.loc[etfs].values))
+                            vol_opt = float(np.sqrt(w_opt.values @ cov.loc[etfs, etfs].values @ w_opt.values))
+                            sharpe_opt = (mu_opt - rf_local) / vol_opt if vol_opt > 0 else np.nan
+                            mu_cur = float(np.dot(w_cur.values, mean_ret.loc[etfs].reindex(w_cur.index).values))
+                            vol_cur = float(np.sqrt(w_cur.values @ cov.loc[w_cur.index, w_cur.index].values @ w_cur.values))
+                            sharpe_cur = (mu_cur - rf_local) / vol_cur if vol_cur > 0 else np.nan
+
+                            c1,c2,c3 = st.columns(3)
+                            c1.metric("Retorno esperado (actual vs óptimo)", f"{mu_cur*100:.2f}% → {mu_opt*100:.2f}%")
+                            c2.metric("Riesgo anualizado (actual vs óptimo)", f"{vol_cur*100:.2f}% → {vol_opt*100:.2f}%")
+                            c3.metric("Sharpe (actual vs óptimo)", f"{sharpe_cur:.2f} → {sharpe_opt:.2f}")
+
+                            comp = compare_weights_table(w_cur, w_opt)
+                            st.subheader("Pesos en ETFs (normalizados a 100%)")
+                            st.dataframe(comp.style.format({"Actual":"{:.2f}%", "Propuesto":"{:.2f}%", "Δ (pp)":"{:.2f}"}),
+                                         use_container_width=True)
+                            st.caption(f"Turnover estimado (ETFs): {turnover_abs(w_cur, w_opt)*100:.2f}%")
+
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=res["vol"], y=res["ret"], mode="markers",
+                                marker=dict(color=res["sharpe"], colorscale="Viridis", showscale=True, colorbar_title="Sharpe"),
+                                name="Portafolios simulados",
+                                hovertemplate="Riesgo: %{x:.2%}<br>Retorno: %{y:.2%}<extra></extra>",
+                            ))
+                            fig.add_trace(go.Scatter(x=[vol_cur], y=[mu_cur], mode="markers+text",
+                                                     text=["Actual"], textposition="top center",
+                                                     marker=dict(color="orange", size=10), name="Actual"))
+                            fig.add_trace(go.Scatter(x=[vol_opt], y=[mu_opt], mode="markers+text",
+                                                     text=["Óptimo"], textposition="bottom center",
+                                                     marker=dict(color="red", size=10), name="Óptimo"))
+                            fig.update_layout(title=f"Frontera simulada (ETFs) · {period_key}",
+                                              xaxis_title="Riesgo (σ anualizado)", yaxis_title="Retorno esperado anualizado",
+                                              template="simple_white", height=520)
+                            st.plotly_chart(fig, use_container_width=True)
 
 elif menu == "Simulación Monte Carlo":
     st.markdown("<h1>Simulación Monte Carlo</h1>", unsafe_allow_html=True)
@@ -961,4 +1203,3 @@ elif menu == "Simulación Monte Carlo":
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Proyecto académico – Ingeniería Financiera")
-
