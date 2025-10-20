@@ -1,7 +1,12 @@
 # App.py — Panel de Finanzas con Google Sheets (Transactions) + Gemini + Plotly
-# Incluye:
-# - Optimización LIBRE por tickers (sección superior)
-# - Debajo: expander "Realizar análisis con mi portafolio" con pestañas "Equity-only" y "ETFs-only"
+# Versión con manejo robusto de yfinance.info para evitar YFRateLimitError
+# Funcionalidades:
+# - Consulta de Acciones (con traducción Gemini) y velas Plotly
+# - Mi Portafolio (Google Sheets), alta/baja de activos
+# - Evaluar nueva acción (básico)
+# - Riesgo de Inversión, CAPM
+# - Optimización de Portafolio (Libre + con tu portafolio: Equity-only y ETFs-only)
+# - Simulación Monte Carlo
 
 import os
 import re
@@ -18,26 +23,41 @@ from plotly.subplots import make_subplots
 from google.oauth2.service_account import Credentials
 import gspread
 
+# ===== yfinance utils para capturar rate limit =====
+try:
+    from yfinance.utils import YFRateLimitError
+except Exception:
+    class YFRateLimitError(Exception):
+        pass
+
 # =========================================================
 # CONFIG GENERAL
 # =========================================================
 st.set_page_config(page_title="Finanzas – Panel", page_icon="📈", layout="wide")
 
-# Estilo sobrio/profesional
+# Paleta con colores complementarios (azules y naranjas sobrios)
 st.markdown("""
 <style>
+:root{
+  --bg:#ffffff; --muted:#6b7280; --line:#e5e7eb;
+  --brand:#0f62fe; --brand-2:#fdba74; --accent:#f97316;
+  --card:#ffffff; --shadow:rgba(0,0,0,.05);
+}
 .main .block-container {max-width: 1220px; padding-top: 1rem; padding-bottom: 2rem;}
 h1,h2,h3 {font-weight:700; letter-spacing:-.2px}
-.section-subtitle { color:#6b7280; margin-bottom: 1.0rem; }
-.hr { border: none; border-top: 1px solid #e5e7eb; margin: 1.0rem 0; }
-.stat-label { color:#6b7280; font-size:.88rem; margin-bottom:.2rem }
-.stat-value { font-weight:700; font-size:1.1rem }
-.card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:12px; height:92px; }
-.stSidebar { border-right:1px solid #e5e7eb; }
+.section-subtitle { color:var(--muted); margin-bottom: 1.0rem; }
+.hr { border: none; border-top: 1px solid var(--line); margin: 1.0rem 0; }
+.stat-label { color:var(--muted); font-size:.88rem; margin-bottom:.2rem }
+.stat-value { font-weight:700; font-size:1.08rem }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; height:92px;
+        box-shadow:0 1px 2px var(--shadow);}
+.stSidebar { border-right:1px solid var(--line); }
 .badge { display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.9rem; }
 .badge-green { background:#e7f8ec; color:#166534; border:1px solid #bbf7d0; }
 .badge-yellow{ background:#fff7e6; color:#92400e; border:1px solid #fde68a; }
 .badge-red   { background:#fee2e2; color:#7f1d1d; border:1px solid #fecaca; }
+div[data-testid="stMetricValue"] { color:#0f172a; }
+div[role="tab"] > div { font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -76,7 +96,7 @@ def range_to_yf_params(range_key: str):
     return mapping.get(range_key, ("6mo", "1d"))
 
 # =========================================================
-# HELPERS: YFINANCE
+# HELPERS: YFINANCE (histórico y cierres)
 # =========================================================
 @st.cache_data(ttl=3600)
 def get_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -137,6 +157,43 @@ def load_prices(tickers, period="5y", interval="1d") -> pd.DataFrame:
         prices.columns = [tickers[0]]
     return prices.dropna(how="all")
 
+# =========================================================
+# NUEVO: INFO SEGURO (evitar rate limit)
+# =========================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def safe_get_info(symbol: str) -> dict:
+    """Intenta obtener info; si hay rate-limit u otro error, devuelve {}."""
+    try:
+        t = yf.Ticker(symbol)
+        # yfinance >=0.2 usa get_info internamente; .info sigue llamando a scraping pesado
+        return t.get_info()
+    except YFRateLimitError:
+        return {}
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def safe_fast_info(symbol: str) -> dict:
+    """fast_info no trae summary pero sí métricas útiles sin scraping pesado."""
+    out = {}
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        # Convert fast_info a dict plano serializable
+        for k in dir(fi):
+            if k.startswith("_"): continue
+            try:
+                v = getattr(fi, k)
+                if isinstance(v, (int, float, str, type(None))):
+                    out[k] = v
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+# =========================================================
+# MÉTRICAS / RIESGO
+# =========================================================
 def return_metrics(df: pd.DataFrame):
     d = df.copy()
     d["Return"] = d["Close"].pct_change()
@@ -189,7 +246,7 @@ def ratio(x):
 TEMPLATE = "simple_white"
 COLOR_UP, COLOR_UP_FILL = "rgba(22,163,74,1)", "rgba(22,163,74,0.9)"
 COLOR_DOWN, COLOR_DOWN_FILL = "rgba(220,38,38,1)", "rgba(220,38,38,0.9)"
-SMA_COLORS = {"SMA20":"#5546d6","SMA50":"#f59e0b","SMA200":"#b78d0a"}
+SMA_COLORS = {"SMA20":"#2563eb","SMA50":"#f59e0b","SMA200":"#ea580c"}  # azules/naranjas
 
 def add_smas(df: pd.DataFrame, windows=(20,50,200)):
     out = df.copy()
@@ -481,7 +538,6 @@ def returns_matrix(prices: pd.DataFrame) -> pd.DataFrame:
     return prices.pct_change().dropna(how="all").dropna(axis=0, how="any")
 
 def shrink_cov(cov: pd.DataFrame, alpha: float = 0.10) -> pd.DataFrame:
-    """Shrinkage simple hacia la diagonal: Σ_shrink = (1-α)Σ + α·diag(Σ)."""
     if cov.empty: return cov
     diag = np.diag(np.diag(cov.values))
     shrunk = (1 - alpha) * cov.values + alpha * diag
@@ -494,18 +550,12 @@ def simulate_portfolios(mean_ret: pd.Series,
                         per_asset_max: float,
                         group_limits: dict | None,
                         classes: dict):
-    """
-    Simula portafolios aleatorios (Dirichlet + rechazo) cumpliendo:
-    - Long-only, sum(w)=1
-    - Límites por activo [min,max]
-    - Límites por grupo (dict: {"Tecnología (alto beta)": (min,max), ...})
-    """
     assets = list(mean_ret.index)
     A = len(assets)
     results = []
     weights_list = []
     tries = 0
-    max_tries = n_sims * 30  # margen amplio de reintentos
+    max_tries = n_sims * 30
 
     def valid_groups(w):
         if not group_limits: return True
@@ -528,7 +578,7 @@ def simulate_portfolios(mean_ret: pd.Series,
             continue
         port_ret = float(np.dot(w, mean_ret.values))
         port_vol = float(np.sqrt(w.T @ cov.values @ w))
-        sharpe = port_ret / port_vol if port_vol > 0 else np.nan  # rf se aplica fuera si se quiere
+        sharpe = port_ret / port_vol if port_vol > 0 else np.nan
         results.append((port_vol, port_ret, sharpe))
         weights_list.append(w)
 
@@ -587,15 +637,20 @@ if menu == "Consulta de Acciones":
     with c4:
         show_sma200 = st.checkbox("SMA200", value=False)
 
-    ticker = yf.Ticker(stonk)
-    info = ticker.info if hasattr(ticker, "info") else {}
+    # == NUEVO: obtener info de forma robusta ==
+    info = safe_get_info(stonk)  # puede devolver {}
+    fast = safe_fast_info(stonk) # métricas básicas
 
+    long_name = info.get("longName") or info.get("shortName") or stonk
     st.subheader("Empresa")
-    st.write(info.get("longName", "No disponible"))
+    st.write(long_name)
 
     st.subheader("Descripción (inglés)")
-    summary = info.get("longBusinessSummary", "No disponible.")
-    st.write(summary if summary else "No disponible.")
+    summary = info.get("longBusinessSummary") or ""
+    if summary:
+        st.write(summary)
+    else:
+        st.info("No se pudo cargar la descripción (posible límite de Yahoo). Puedes intentar más tarde o cambiar de símbolo.")
 
     if st.button("Traducir a español"):
         if not API_KEY:
@@ -618,17 +673,29 @@ if menu == "Consulta de Acciones":
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     st.subheader("Indicadores clave")
 
+    # Fallbacks: usar fast_info si info no tiene los campos
+    market_cap = info.get("marketCap") or fast.get("market_cap")
+    beta_5y = info.get("beta")  # no está en fast_info
+    pe_trailing = info.get("trailingPE")
+    pe_forward = info.get("forwardPE")
+    ptb = info.get("priceToBook")
+    div_yield = info.get("dividendYield")
+    wk_change = info.get("52WeekChange")
+    sector = info.get("sector", "N/A")
+    industry = info.get("industry", "N/A")
+    country = info.get("country", "N/A")
+
     key_data = {
-        "Sector": info.get("sector", "N/A"),
-        "Industria": info.get("industry", "N/A"),
-        "País": info.get("country", "N/A"),
-        "Market Cap": human_number(info.get("marketCap")),
-        "Beta (5y mensual)": ratio(info.get("beta")),
-        "P/E (Trailing)": ratio(info.get("trailingPE")),
-        "P/E (Forward)": ratio(info.get("forwardPE")),
-        "P/B": ratio(info.get("priceToBook")),
-        "Dividend Yield": pct(info.get("dividendYield")),
-        "Cambio 52 semanas": pct(info.get("52WeekChange")),
+        "Sector": sector,
+        "Industria": industry,
+        "País": country,
+        "Market Cap": human_number(market_cap),
+        "Beta (5y mensual)": ratio(beta_5y),
+        "P/E (Trailing)": ratio(pe_trailing),
+        "P/E (Forward)": ratio(pe_forward),
+        "P/B": ratio(ptb),
+        "Dividend Yield": pct(div_yield),
+        "Cambio 52 semanas": pct(wk_change),
     }
     cols_top = st.columns(5); cols_bottom = st.columns(5)
     keys = list(key_data.keys())
@@ -848,10 +915,11 @@ elif menu == "Evaluar nueva acción (básico)":
     corr_candidate = np.nan
     if new_ticker in prices.columns:
         cand_ret = prices[new_ticker].pct_change().dropna()
-        corr_candidate = np.corrcoef(
-            cand_ret.reindex(port_ret.index).dropna(),
-            port_ret.reindex(cand_ret.index).dropna()
-        )[0,1] if not port_ret.empty else np.nan
+        if not port_ret.empty:
+            corr_candidate = np.corrcoef(
+                cand_ret.reindex(port_ret.index).dropna(),
+                port_ret.reindex(cand_ret.index).dropna()
+            )[0,1]
 
     decision = "Considerar"; badge_class = "badge-yellow"
     cond_verde = (delta_sharpe >= 0.03) and (delta_mdd >= -0.02) and (np.isnan(corr_candidate) or corr_candidate <= 0.75)
@@ -1036,7 +1104,7 @@ elif menu == "Optimización de Portafolio (Markowitz)":
         else:
             tab_eq, tab_etf = st.tabs(["Equity-only", "ETFs-only"])
 
-            # -------- Equity-only (excluye ETFs amplios) --------
+            # -------- Equity-only --------
             with tab_eq:
                 st.caption("Optimiza solo acciones presentes en tu hoja (excluye SPY/VOO/IVV/QQQ/IWM).")
 
