@@ -1,8 +1,3 @@
-
----
-
-# `app.py`
-```python
 import os
 import json
 from datetime import datetime, timedelta
@@ -609,4 +604,3 @@ elif page == "Herramientas":
             st.metric("P5", f"{(p5-1)*100:,.2f}%"); st.metric("P50", f"{(p50-1)*100:,.2f}%"); st.metric("P95", f"{(p95-1)*100:,.2f}%")
             fig = px.histogram(sim_end-1, nbins=40, title="Distribución de rendimientos simulados")
             st.plotly_chart(fig, use_container_width=True)
-
