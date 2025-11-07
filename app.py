@@ -24,7 +24,6 @@ div[data-testid="stMetricValue"]{font-size:1.6rem}
 SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
 GCP_SA = st.secrets.get("gcp_service_account", {})
-SHOW_DEBUG = bool(st.secrets.get("SHOW_DEBUG", False))
 
 if not SHEET_ID or not GCP_SA:
     st.error("Faltan secretos: `SHEET_ID` y/o `gcp_service_account`.")
@@ -41,8 +40,55 @@ def read_sheet(name:str)->pd.DataFrame:
     df = pd.DataFrame(ws.get_all_records())
     return df
 
-def write_sheet_append(name:str, row:list):
-    sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
+def _get_ws(name:str):
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.worksheet(name)
+
+def append_transaction(
+    ticker:str, trade_date:str, side:str, shares:float, price:float, fees:float=0.0, notes:str=""
+):
+    """
+    Inserta una transacción respetando el ORDEN REAL de columnas en la hoja.
+    Si no existe la columna 'Side', usa signo de Shares (+ compra, - venta).
+    """
+    ws = _get_ws("Transactions")
+    headers = ws.row_values(1)  # primera fila
+    headers_norm = [h.strip() for h in headers]
+
+    payload = {h: "" for h in headers_norm}
+
+    # Normaliza valores
+    ticker = (ticker or "").upper().strip().replace(" ", "")
+    trade_date = (pd.to_datetime(trade_date, errors="coerce").date() if trade_date else datetime.utcnow().date())
+    side_norm = (side or "Buy").strip().lower()
+    shares = float(shares or 0)
+    price = float(price or 0)
+    fees = float(fees or 0)
+
+    # Si no existe Side, usamos Shares con signo; si existe, usamos Shares absoluto + Side textual
+    if "Side" in headers_norm:
+        payload["Side"] = "Buy" if side_norm in ("buy","compra","1") else "Sell"
+        shares_out = abs(shares)
+    else:
+        # Shares con signo
+        shares_out = shares if side_norm in ("sell","venta","vender","-1") else abs(shares)
+
+    # Asigna lo que tengamos mapeando nombres conocidos
+    mapping = {
+        "Ticker": ticker,
+        "TradeDate": trade_date.strftime("%Y-%m-%d"),
+        "Shares": shares_out,
+        "Price": price,
+        "Fees": fees,
+        "Notes": notes,
+    }
+    # Copia a payload sólo las columnas existentes
+    for k, v in mapping.items():
+        if k in payload:
+            payload[k] = v
+
+    # Arma la fila en el ORDEN exacto de la hoja
+    row = [payload.get(h, "") for h in headers_norm]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -56,6 +102,7 @@ def load_all_data():
             return df
         except Exception:
             return pd.DataFrame(columns=cols)
+    # NOTA: la mayoría de tus hojas no tienen 'Side', pero lo incluimos para homogeneizar.
     tx = safe("Transactions", ["Ticker","TradeDate","Side","Shares","Price","Fees","Notes"])
     settings = safe("Settings", ["Key","Value","Description"])
     watchlist = safe("Watchlist", ["Ticker","TargetWeight","Notes"])
@@ -69,7 +116,7 @@ def get_setting(settings_df, key, default=None, cast=float):
     except Exception:
         return default
 
-# ================== DATA FETCH (Robusto) ==================
+# ================== DATA: YF/STOOQ ==================
 def _flatten_close(df_or_panel, expected):
     if df_or_panel is None or len(df_or_panel)==0:
         return pd.DataFrame()
@@ -126,10 +173,6 @@ def _fetch_one_stooq(t, start, end):
     return pd.DataFrame()
 
 def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_pref="Auto"):
-    """
-    source_pref: "Auto" (Yahoo→Stooq), "Yahoo", "Stooq"
-    Devuelve (prices_df, failed_list)
-    """
     uniq = _clean_tickers(tickers)
     if not uniq: return pd.DataFrame(), []
 
@@ -179,7 +222,7 @@ def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_
             return (df if not df.empty else pd.DataFrame()), miss if df.empty else [t for t in miss if t not in df.columns]
         return pd.DataFrame(), uniq
 
-    # Auto: Yahoo → Stooq para faltantes
+    # Auto
     pcs, miss = try_yahoo()
     if miss:
         pcs2, miss2 = try_stooq(miss)
@@ -223,7 +266,7 @@ def last_prices_resilient(tickers, source_pref="Auto"):
                 ok[t] = float(d.iloc[-1, 0])
 
     if source_pref in ("Auto","Stooq"):
-        import pandas_datareader.data as pdr  # necesita estar en requirements
+        import pandas_datareader.data as pdr
         tried_stooq = True
         for t in uniq:
             if t in ok: continue
@@ -236,9 +279,6 @@ def last_prices_resilient(tickers, source_pref="Auto"):
 
     for t in uniq:
         if t not in ok: failed.append(t)
-    if tried_stooq and failed:
-        # Algunos símbolos (por ejemplo ^GSPC) no existen en Stooq; se reportan como fallidos.
-        pass
     return ok, failed
 
 # ================== METRICS ==================
@@ -294,18 +334,30 @@ def regression_beta_alpha(p,b,freq=252):
 def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
     if tx.empty: return tx
     df = tx.copy()
+    # Normaliza columnas esperadas
     for c in ["Ticker","TradeDate","Side","Shares","Price","Fees","Notes"]:
         if c not in df.columns: df[c]=np.nan
+
     df["Ticker"]=(df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False))
     df["Ticker"].replace({"":np.nan}, inplace=True)
     df = df.dropna(subset=["Ticker"])
-    df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
-    def signed(r):
-        side=str(r.get("Side","")).strip().lower()
-        q=float(r.get("Shares",0) or 0)
-        if side in ("sell","venta","vender","-1"): return -abs(q)
-        if side in ("buy","compra","1"): return  abs(q)
-        return q
+
+    # Casteos robustos
+    df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce").dt.date
+    df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce").fillna(0.0)
+    df["Price"]  = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+    df["Fees"]   = pd.to_numeric(df["Fees"], errors="coerce").fillna(0.0)
+
+    def signed(row):
+        # Si existe Side → usa Side; si no → usa signo de Shares
+        side = str(row.get("Side","")).strip().lower()
+        q = float(row.get("Shares",0) or 0)
+        if "Side" in df.columns and df["Side"].notna().any():
+            if side in ("sell","venta","vender","-1"): return -abs(q)
+            if side in ("buy","compra","1"): return  abs(q)
+            # si Side vacío, caemos al signo
+        return q  # Shares ya es positivo/negativo según lo escrito
+
     df["SignedShares"]=df.apply(signed,axis=1)
     return df
 
@@ -411,23 +463,22 @@ if page=="Mi Portafolio":
         st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-
     prices, failed = fetch_prices_resilient(tickers+[benchmark], start=start_date, source_pref=st.session_state["data_source"])
+
     bench_series = pd.Series(dtype=float)
     if not prices.empty and benchmark in prices.columns:
         bench_series = prices[[benchmark]].pct_change().dropna()[benchmark]
         prices = prices.drop(columns=[benchmark], errors="ignore")
-    elif data_source!="Stooq" and "SPY" not in tickers:
-        # si falta benchmark, intenta proxy SPY
+    elif "SPY" not in tickers:
         alt, _ = fetch_prices_resilient(tickers+["SPY"], start=start_date, source_pref=st.session_state["data_source"])
         if not alt.empty and "SPY" in alt.columns:
             bench_series = alt["SPY"].pct_change().dropna()
             prices = alt.drop(columns=["SPY"], errors="ignore")
 
     if prices.empty:
-        msg = "No se pudieron obtener precios históricos."
+        msg="No se pudieron obtener precios históricos."
         if failed: msg += " Tickers con problemas: " + ", ".join(failed)
-        st.warning(msg + " Revisa símbolos / fuente seleccionada o intenta más tarde.")
+        st.warning(msg + " Revisa símbolos o intenta más tarde.")
         st.stop()
 
     w = weights_from_positions(pos_df)
@@ -527,89 +578,75 @@ elif page=="Optimizar y Rebalancear":
             if st.button("Registrar todas"):
                 today=datetime.utcnow().date().strftime("%Y-%m-%d")
                 for _,r in ord_df.iterrows():
-                    write_sheet_append("Transactions",[r["Ticker"],today,r["Side"],r["Shares"],r["EstPrice"],0.0,"Auto-rebalance simulado"])
+                    append_transaction(
+                        ticker=r["Ticker"],
+                        trade_date=today,
+                        side=r["Side"],
+                        shares=int(r["Shares"]),
+                        price=float(r["EstPrice"]),
+                        fees=0.0,
+                        notes="Auto-rebalance simulado"
+                    )
                 st.success("Órdenes registradas. Pulsa R para refrescar.")
 
 # ================== EVALUAR CANDIDATO ==================
-elif page == "Evaluar Candidato":
+elif page=="Evaluar Candidato":
     st.title("🧪 Evaluar Candidato")
     pos_df = positions_from_tx(tx_df)
-    if pos_df.empty:
-        st.info("Sin posiciones.")
-        st.stop()
+    if pos_df.empty: st.info("Sin posiciones."); st.stop()
 
-    tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ", "")
-    if not tkr:
-        st.stop()
+    tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
+    if not tkr: st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    all_tickers = sorted(set(tickers + [tkr]))
-
-    prices, failed = fetch_prices_resilient(
-        all_tickers, start=start_date, source_pref=st.session_state.get("data_source", "Auto")
-    )
+    all_tickers = sorted(set(tickers+[tkr]))
+    prices, failed = fetch_prices_resilient(all_tickers, start=start_date, source_pref=st.session_state["data_source"])
     if prices.empty:
-        st.warning("No se pudieron descargar precios para el candidato. " + ("Fallas: " + ", ".join(failed) if failed else ""))
-        st.stop()
+        st.warning("No se pudieron descargar precios para el candidato. " + ("Fallas: "+", ".join(failed) if failed else "")); st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    alloc_mode = st.radio("Forma de evaluación", ["Asignar porcentaje", "Añadir acciones"], horizontal=True)
+    mode = st.radio("Forma de evaluación", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
 
-    last_map, _ = last_prices_resilient([tkr], source_pref=st.session_state.get("data_source", "Auto"))
-    last = last_map.get(tkr, np.nan)
-    if np.isnan(last):
-        st.warning("Ticker inválido o sin precio reciente.")
-        st.stop()
+    last_map,_ = last_prices_resilient([tkr], source_pref=st.session_state["data_source"])
+    last=last_map.get(tkr,np.nan)
+    if np.isnan(last): st.warning("Ticker inválido o sin precio reciente."); st.stop()
 
-    if alloc_mode == "Asignar porcentaje":
-        pct = st.slider("Peso objetivo del candidato", 0.0, 0.40, 0.10, 0.01)
-        w_new = (w_cur * (1 - pct)).reindex(all_tickers).fillna(0.0)
-        w_new[tkr] += pct
+    if mode=="Asignar porcentaje":
+        pct=st.slider("Peso objetivo del candidato",0.0,0.40,0.10,0.01)
+        w_new=(w_cur*(1-pct)).reindex(all_tickers).fillna(0.0); w_new[tkr]+=pct
+        qty_to_log = 0
     else:
-        qty = st.number_input("Acciones a comprar (simulado)", min_value=1, value=5, step=1)
-        pv = pos_df["MarketValue"].sum()
-        add_value = qty * last
-        base = pv + add_value if (pv + add_value) > 0 else 1.0
-        w_new = (w_cur * pv) / base
-        w_new = w_new.reindex(all_tickers).fillna(0.0)
-        w_new[tkr] += add_value / base
+        qty=st.number_input("Acciones a comprar (simulado)",min_value=1,value=5,step=1)
+        pv=pos_df["MarketValue"].sum(); add=qty*last; base=pv+add if (pv+add)>0 else 1.0
+        w_new=(w_cur*pv)/base; w_new=w_new.reindex(all_tickers).fillna(0.0); w_new[tkr]+=add/base
+        qty_to_log = int(qty)
 
-    # Retornos
-    port_cur, _ = const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
-    port_new, assets_new = const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
+    port_cur,_=const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
+    port_new,assets_new=const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
 
-    # Métricas (protegidas contra NaN)
-    sh_old = sharpe(port_cur, rf)
-    sh_new = sharpe(port_new, rf)
-    cum_cur = (1 + port_cur).cumprod() if not port_cur.empty else pd.Series(dtype=float)
-    cum_new = (1 + port_new).cumprod() if not port_new.empty else pd.Series(dtype=float)
-    mdd_cur = max_drawdown(cum_cur) if not cum_cur.empty else np.nan
-    mdd_new = max_drawdown(cum_new) if not cum_new.empty else np.nan
+    c=st.columns(4)
+    sh_old=sharpe(port_cur,rf); sh_new=sharpe(port_new,rf)
+    c[0].metric("Sharpe actual", f"{(sh_old or 0):.2f}")
+    c[1].metric("Sharpe con candidato", f"{(sh_new or 0):.2f}",
+                delta=None if (pd.isna(sh_old) or pd.isna(sh_new)) else f"{(sh_new-sh_old):.2f}")
+    cum_cur=(1+port_cur).cumprod() if not port_cur.empty else pd.Series(dtype=float)
+    cum_new=(1+port_new).cumprod() if not port_new.empty else pd.Series(dtype=float)
+    mdd_cur=max_drawdown(cum_cur) if not cum_cur.empty else np.nan
+    mdd_new=max_drawdown(cum_new) if not cum_new.empty else np.nan
+    c[2].metric("MDD actual", f"{(0 if pd.isna(mdd_cur) else mdd_cur)*100:,.2f}%")
+    c[3].metric("MDD con candidato", f"{(0 if pd.isna(mdd_new) else mdd_new)*100:,.2f}%",
+                delta=None if (pd.isna(mdd_cur) or pd.isna(mdd_new)) else f"{((mdd_new-mdd_cur)*100):.2f}%")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sharpe actual", f"{(sh_old or 0):.2f}")
-    c2.metric("Sharpe con candidato", f"{(sh_new or 0):.2f}",
-              delta=None if (pd.isna(sh_old) or pd.isna(sh_new)) else f"{(sh_new - sh_old):.2f}")
-    c3.metric("MDD actual", f"{(0 if pd.isna(mdd_cur) else mdd_cur)*100:,.2f}%")
-    c4.metric("MDD con candidato", f"{(0 if pd.isna(mdd_new) else mdd_new)*100:,.2f}%",
-              delta=None if (pd.isna(mdd_cur) or pd.isna(mdd_new)) else f"{((mdd_new - mdd_cur)*100):.2f}%")
-
-    # Correlación candidato vs cartera
-    rho = np.nan
+    rho=np.nan
     if tkr in assets_new.columns and not port_cur.empty:
-        rho = assets_new[tkr].corr(port_cur.reindex(assets_new.index))
-        if not np.isnan(rho):
-            st.caption(f"Correlación candidato vs. cartera: **{rho:.2f}**")
+        rho=assets_new[tkr].corr(port_cur.reindex(assets_new.index))
+        if not np.isnan(rho): st.caption(f"Correlación candidato vs. cartera: **{rho:.2f}**")
 
-    # Regla de decisión (umbral simple)
-    delta_sharpe = (sh_new if not pd.isna(sh_new) else np.nan) - (sh_old if not pd.isna(sh_old) else np.nan)
-    pass_rule = (
-        (not pd.isna(delta_sharpe) and delta_sharpe >= 0.03)
-        and (not pd.isna(mdd_cur) and not pd.isna(mdd_new) and (mdd_new - mdd_cur) >= -0.02)
-        and (pd.isna(rho) or rho <= 0.75)
-    )
+    delta_sh=(sh_new if not pd.isna(sh_new) else np.nan)-(sh_old if not pd.isna(sh_old) else np.nan)
+    pass_rule=( (not pd.isna(delta_sh) and delta_sh>=0.03)
+                and (not pd.isna(mdd_cur) and not pd.isna(mdd_new) and (mdd_new-mdd_cur)>=-0.02)
+                and (pd.isna(rho) or rho<=0.75) )
 
-    # 👇 Importante: if/else explícito (sin operador ternario) para evitar el bug de Streamlit
     if pass_rule:
         st.success("✅ Recomendación positiva.")
     else:
@@ -617,11 +654,18 @@ elif page == "Evaluar Candidato":
 
     with st.expander("Registrar compra simulada en Transactions"):
         if st.button("Registrar (Buy)"):
-            today = datetime.utcnow().date().strftime("%Y-%m-%d")
-            qty_to_log = 5 if alloc_mode == "Añadir acciones" else 0
-            write_sheet_append("Transactions", [tkr, today, "Buy", qty_to_log, last, 0.0, "Evaluación aprobada"])
+            today=datetime.utcnow().date().strftime("%Y-%m-%d")
+            append_transaction(
+                ticker=tkr,
+                trade_date=today,
+                side="Buy",
+                shares=qty_to_log,   # 0 si usaste 'Asignar porcentaje'
+                price=float(last),
+                fees=0.0,
+                notes="Evaluación aprobada"
+            )
             st.success("Operación registrada.")
-            
+
 # ================== EXPLORAR ==================
 elif page=="Explorar / Research":
     st.title("🔎 Explorar / Research")
