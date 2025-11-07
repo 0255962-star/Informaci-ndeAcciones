@@ -37,7 +37,7 @@ gc = gspread.authorize(credentials)
 def refresh_data():
     """Limpia todos los cachés de datos para que se relea el Google Sheet."""
     try:
-        read_sheet.clear()        # borra cache de la función
+        read_sheet.clear()
     except Exception:
         pass
     try:
@@ -45,7 +45,7 @@ def refresh_data():
     except Exception:
         pass
     try:
-        st.cache_data.clear()     # borra caché global de streamlit
+        st.cache_data.clear()
     except Exception:
         pass
 
@@ -182,113 +182,97 @@ def _fetch_one_stooq(t, start, end):
         pass
     return pd.DataFrame()
 
+# ========= NUEVA DESCARGA RESILIENTE (por ticker, concatena lo que sirva) =========
 def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_pref="Auto"):
+    """
+    Descarga precios **por ticker** con fallback Yahoo -> Stooq, y concatena solo los que funcionen.
+    Nunca deja que un símbolo sin datos invalide a los demás.
+    Devuelve: (prices_df, failed_list)
+    """
     uniq = _clean_tickers(tickers)
-    if not uniq: return pd.DataFrame(), []
+    if not uniq:
+        return pd.DataFrame(), []
 
     if start is None:
         start = (datetime.utcnow() - timedelta(days=365*3)).strftime("%Y-%m-%d")
     if end is None:
         end = datetime.utcnow().strftime("%Y-%m-%d")
 
+    series_dict = {}
     failed = []
-    pieces = []
 
-    def try_yahoo():
-        bulk = _fetch_bulk_yf(uniq, start, end, interval)
-        have = set(bulk.columns) if not bulk.empty else set()
-        pcs = []
-        if not bulk.empty: pcs.append(bulk)
-        miss = []
-        for t in uniq:
-            if t in have: continue
+    def fetch_one_all(t):
+        # 1) Yahoo directo
+        if source_pref in ("Auto", "Yahoo"):
             d = _fetch_one_yf(t, start, end, interval)
-            if d.empty: miss.append(t)
-            else: pcs.append(d)
-        return pcs, miss
-
-    def try_stooq(miss_list=None):
-        base = uniq if miss_list is None else miss_list
-        pcs = []; miss = []
-        for t in base:
+            if not d.empty:
+                return d
+        # 2) Stooq
+        if source_pref in ("Auto", "Stooq"):
             d = _fetch_one_stooq(t, start, end)
-            if d.empty: miss.append(t)
-            else: pcs.append(d)
-        return pcs, miss
+            if not d.empty:
+                return d
+        return pd.DataFrame()
 
-    if source_pref == "Yahoo":
-        pcs, miss = try_yahoo()
-        if pcs:
-            df = pd.concat(pcs, axis=1).sort_index()
-            df = df.loc[:, df.notna().any()]
-            return (df if not df.empty else pd.DataFrame()), miss if df.empty else [t for t in miss if t not in df.columns]
-        return pd.DataFrame(), uniq
+    for t in uniq:
+        d = fetch_one_all(t)
+        if d.empty:
+            failed.append(t)
+        else:
+            if isinstance(d, pd.Series):
+                d = d.to_frame(name=t)
+            elif t not in d.columns and d.shape[1] == 1:
+                d.columns = [t]
+            series_dict[t] = d
 
-    if source_pref == "Stooq":
-        pcs, miss = try_stooq()
-        if pcs:
-            df = pd.concat(pcs, axis=1).sort_index()
-            df = df.loc[:, df.notna().any()]
-            return (df if not df.empty else pd.DataFrame()), miss if df.empty else [t for t in miss if t not in df.columns]
-        return pd.DataFrame(), uniq
+    if not series_dict:
+        return pd.DataFrame(), failed
 
-    # Auto
-    pcs, miss = try_yahoo()
-    if miss:
-        pcs2, miss2 = try_stooq(miss)
-        pcs += pcs2
-        failed = miss2
-    if pcs:
-        df = pd.concat(pcs, axis=1).sort_index()
-        df = df.loc[:, df.notna().any()]
-        if df.empty:
-            return pd.DataFrame(), uniq
-        return df, failed
-    return pd.DataFrame(), uniq
+    df = pd.concat([series_dict[k] for k in sorted(series_dict.keys())], axis=1).sort_index()
+    df = df.loc[:, df.notna().any()]
+    return df, failed
 
 def last_prices_resilient(tickers, source_pref="Auto"):
     uniq = _clean_tickers(tickers)
-    if not uniq: return {}, []
+    if not uniq:
+        return {}, []
     ok, failed = {}, []
 
-    def last_from_df(df, cols_expected):
-        nonlocal ok
-        if df is not None and not df.empty:
-            close = _flatten_close(df, cols_expected).ffill().dropna(how="all")
-            if close is not None and not close.empty:
-                row = close.tail(1)
-                for c in row.columns:
-                    v = row.iloc[0][c]
-                    if pd.notna(v): ok[c] = float(v)
-
-    tried_stooq = False
-
-    if source_pref in ("Auto","Yahoo"):
+    def try_one_yahoo(t):
         try:
-            df = yf.download(uniq, period="5d", interval="1d", auto_adjust=True, progress=False, threads=True)
-            last_from_df(df, uniq)
+            d = yf.download(t, period="5d", interval="1d", auto_adjust=True, progress=False)
+            if not d.empty:
+                c = _flatten_close(d, [t]).ffill().dropna(how="all")
+                if not c.empty:
+                    return float(c.iloc[-1, 0])
+            hist = yf.Ticker(t).history(period="10d", auto_adjust=True)
+            if not hist.empty and "Close" in hist:
+                return float(hist["Close"].dropna().iloc[-1])
         except Exception:
             pass
-        for t in uniq:
-            if t in ok: continue
-            d = _fetch_one_yf(t, (datetime.utcnow()-timedelta(days=10)).strftime("%Y-%m-%d"), datetime.utcnow().strftime("%Y-%m-%d"), "1d")
-            if not d.empty:
-                ok[t] = float(d.iloc[-1, 0])
+        return np.nan
 
-    if source_pref in ("Auto","Stooq"):
-        import pandas_datareader.data as pdr
-        tried_stooq = True
-        for t in uniq:
-            if t in ok: continue
-            try:
-                d = pdr.DataReader(t, "stooq", start=datetime.utcnow()-timedelta(days=10), end=datetime.utcnow())
-                if d is not None and not d.empty and "Close" in d:
-                    ok[t] = float(d.sort_index()["Close"].dropna().iloc[-1])
-            except Exception:
-                pass
+    def try_one_stooq(t):
+        try:
+            import pandas_datareader.data as pdr
+            d = pdr.DataReader(t, "stooq", start=datetime.utcnow()-timedelta(days=10), end=datetime.utcnow())
+            if d is not None and not d.empty and "Close" in d:
+                return float(d.sort_index()["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
+        return np.nan
 
     for t in uniq:
-        if t not in ok: failed.append(t)
+        price = np.nan
+        if source_pref in ("Auto","Yahoo"):
+            price = try_one_yahoo(t)
+        if (np.isnan(price)) and source_pref in ("Auto","Stooq"):
+            price = try_one_stooq(t)
+        if np.isnan(price):
+            failed.append(t)
+        else:
+            ok[t] = price
+
     return ok, failed
 
 # ================== METRICS ==================
@@ -473,22 +457,29 @@ if page=="Mi Portafolio":
         st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    prices, failed = fetch_prices_resilient(tickers+[benchmark], start=start_date, source_pref=st.session_state["data_source"])
+
+    # Traemos también el benchmark, pero si no sale, seguimos.
+    prices, failed = fetch_prices_resilient(tickers + [benchmark], start=start_date, source_pref=st.session_state["data_source"])
 
     bench_series = pd.Series(dtype=float)
     if not prices.empty and benchmark in prices.columns:
         bench_series = prices[[benchmark]].pct_change().dropna()[benchmark]
         prices = prices.drop(columns=[benchmark], errors="ignore")
-    elif "SPY" not in tickers:
-        alt, _ = fetch_prices_resilient(tickers+["SPY"], start=start_date, source_pref=st.session_state["data_source"])
-        if not alt.empty and "SPY" in alt.columns:
-            bench_series = alt["SPY"].pct_change().dropna()
-            prices = alt.drop(columns=["SPY"], errors="ignore")
+    else:
+        if "SPY" not in tickers:
+            alt, _ = fetch_prices_resilient(["SPY"], start=start_date, source_pref=st.session_state["data_source"])
+            if not alt.empty and "SPY" in alt.columns:
+                bench_series = alt["SPY"].pct_change().dropna()
 
-    if prices.empty:
-        msg="No se pudieron obtener precios históricos."
-        if failed: msg += " Tickers con problemas: " + ", ".join(failed)
-        st.warning(msg + " Revisa símbolos o intenta más tarde.")
+    failed_set = set(failed)
+    if not prices.empty and len(prices.columns) > 0:
+        if failed_set:
+            st.warning("No hubo histórico para: " + ", ".join(sorted(failed_set)))
+    else:
+        msg = "No se pudieron obtener precios históricos."
+        if failed_set:
+            msg += " Tickers con problemas: " + ", ".join(sorted(failed_set))
+        st.warning(msg + " Revisa símbolos / fuente seleccionada o intenta más tarde.")
         st.stop()
 
     w = weights_from_positions(pos_df)
