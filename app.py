@@ -33,6 +33,22 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis
 credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
 gc = gspread.authorize(credentials)
 
+# ================== REFRESH / CACHE ==================
+def refresh_data():
+    """Limpia todos los cachés de datos para que se relea el Google Sheet."""
+    try:
+        read_sheet.clear()        # borra cache de la función
+    except Exception:
+        pass
+    try:
+        load_all_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_data.clear()     # borra caché global de streamlit
+    except Exception:
+        pass
+
 # ================== SHEETS HELPERS ==================
 @st.cache_data(show_spinner=False, ttl=600)
 def read_sheet(name:str)->pd.DataFrame:
@@ -52,7 +68,7 @@ def append_transaction(
     Si no existe la columna 'Side', usa signo de Shares (+ compra, - venta).
     """
     ws = _get_ws("Transactions")
-    headers = ws.row_values(1)  # primera fila
+    headers = ws.row_values(1)
     headers_norm = [h.strip() for h in headers]
 
     payload = {h: "" for h in headers_norm}
@@ -65,15 +81,12 @@ def append_transaction(
     price = float(price or 0)
     fees = float(fees or 0)
 
-    # Si no existe Side, usamos Shares con signo; si existe, usamos Shares absoluto + Side textual
     if "Side" in headers_norm:
         payload["Side"] = "Buy" if side_norm in ("buy","compra","1") else "Sell"
         shares_out = abs(shares)
     else:
-        # Shares con signo
-        shares_out = shares if side_norm in ("sell","venta","vender","-1") else abs(shares)
+        shares_out = -abs(shares) if side_norm in ("sell","venta","vender","-1") else abs(shares)
 
-    # Asigna lo que tengamos mapeando nombres conocidos
     mapping = {
         "Ticker": ticker,
         "TradeDate": trade_date.strftime("%Y-%m-%d"),
@@ -82,12 +95,10 @@ def append_transaction(
         "Fees": fees,
         "Notes": notes,
     }
-    # Copia a payload sólo las columnas existentes
     for k, v in mapping.items():
         if k in payload:
             payload[k] = v
 
-    # Arma la fila en el ORDEN exacto de la hoja
     row = [payload.get(h, "") for h in headers_norm]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
@@ -102,7 +113,6 @@ def load_all_data():
             return df
         except Exception:
             return pd.DataFrame(columns=cols)
-    # NOTA: la mayoría de tus hojas no tienen 'Side', pero lo incluimos para homogeneizar.
     tx = safe("Transactions", ["Ticker","TradeDate","Side","Shares","Price","Fees","Notes"])
     settings = safe("Settings", ["Key","Value","Description"])
     watchlist = safe("Watchlist", ["Ticker","TargetWeight","Notes"])
@@ -334,7 +344,6 @@ def regression_beta_alpha(p,b,freq=252):
 def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
     if tx.empty: return tx
     df = tx.copy()
-    # Normaliza columnas esperadas
     for c in ["Ticker","TradeDate","Side","Shares","Price","Fees","Notes"]:
         if c not in df.columns: df[c]=np.nan
 
@@ -342,21 +351,18 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
     df["Ticker"].replace({"":np.nan}, inplace=True)
     df = df.dropna(subset=["Ticker"])
 
-    # Casteos robustos
     df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce").dt.date
     df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce").fillna(0.0)
     df["Price"]  = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
     df["Fees"]   = pd.to_numeric(df["Fees"], errors="coerce").fillna(0.0)
 
     def signed(row):
-        # Si existe Side → usa Side; si no → usa signo de Shares
         side = str(row.get("Side","")).strip().lower()
         q = float(row.get("Shares",0) or 0)
         if "Side" in df.columns and df["Side"].notna().any():
             if side in ("sell","venta","vender","-1"): return -abs(q)
             if side in ("buy","compra","1"): return  abs(q)
-            # si Side vacío, caemos al signo
-        return q  # Shares ya es positivo/negativo según lo escrito
+        return q
 
     df["SignedShares"]=df.apply(signed,axis=1)
     return df
@@ -456,6 +462,10 @@ start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period
 # ================== HOME ==================
 if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
+
+    if st.button("🔄 Refrescar datos", help="Vuelve a leer Google Sheets y precios"):
+        refresh_data()
+        st.rerun()
 
     pos_df = positions_from_tx(tx_df)
     if pos_df.empty:
@@ -579,15 +589,13 @@ elif page=="Optimizar y Rebalancear":
                 today=datetime.utcnow().date().strftime("%Y-%m-%d")
                 for _,r in ord_df.iterrows():
                     append_transaction(
-                        ticker=r["Ticker"],
-                        trade_date=today,
-                        side=r["Side"],
-                        shares=int(r["Shares"]),
-                        price=float(r["EstPrice"]),
-                        fees=0.0,
-                        notes="Auto-rebalance simulado"
+                        ticker=r["Ticker"], trade_date=today, side=r["Side"],
+                        shares=int(r["Shares"]), price=float(r["EstPrice"]),
+                        fees=0.0, notes="Auto-rebalance simulado"
                     )
-                st.success("Órdenes registradas. Pulsa R para refrescar.")
+                refresh_data()
+                st.success("Órdenes registradas.")
+                st.rerun()
 
 # ================== EVALUAR CANDIDATO ==================
 elif page=="Evaluar Candidato":
@@ -656,15 +664,12 @@ elif page=="Evaluar Candidato":
         if st.button("Registrar (Buy)"):
             today=datetime.utcnow().date().strftime("%Y-%m-%d")
             append_transaction(
-                ticker=tkr,
-                trade_date=today,
-                side="Buy",
-                shares=qty_to_log,   # 0 si usaste 'Asignar porcentaje'
-                price=float(last),
-                fees=0.0,
-                notes="Evaluación aprobada"
+                ticker=tkr, trade_date=today, side="Buy",
+                shares=qty_to_log, price=float(last), fees=0.0, notes="Evaluación aprobada"
             )
+            refresh_data()
             st.success("Operación registrada.")
+            st.rerun()
 
 # ================== EXPLORAR ==================
 elif page=="Explorar / Research":
