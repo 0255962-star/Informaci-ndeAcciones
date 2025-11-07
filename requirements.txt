@@ -1,13 +1,10 @@
-streamlit
-yfinance
-pandas
-numpy
-plotly
-requests
-
-# Google Sheets
-gspread==6.0.2
-google-auth==2.33.0
-
-# Opcional útil
-lxml
+streamlit==1.39.0
+pandas==2.2.2
+numpy==1.26.4
+yfinance==0.2.43
+plotly==5.24.1
+gspread==6.1.4
+google-auth==2.35.0
+scipy==1.13.1
+requests==2.32.3
+google-generativeai==0.7.2
