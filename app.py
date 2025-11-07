@@ -531,66 +531,97 @@ elif page=="Optimizar y Rebalancear":
                 st.success("Órdenes registradas. Pulsa R para refrescar.")
 
 # ================== EVALUAR CANDIDATO ==================
-elif page=="Evaluar Candidato":
+elif page == "Evaluar Candidato":
     st.title("🧪 Evaluar Candidato")
     pos_df = positions_from_tx(tx_df)
-    if pos_df.empty: st.info("Sin posiciones."); st.stop()
+    if pos_df.empty:
+        st.info("Sin posiciones.")
+        st.stop()
 
-    tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
-    if not tkr: st.stop()
+    tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ", "")
+    if not tkr:
+        st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    all_tickers = sorted(set(tickers+[tkr]))
-    prices, failed = fetch_prices_resilient(all_tickers, start=start_date, source_pref=st.session_state["data_source"])
+    all_tickers = sorted(set(tickers + [tkr]))
+
+    prices, failed = fetch_prices_resilient(
+        all_tickers, start=start_date, source_pref=st.session_state.get("data_source", "Auto")
+    )
     if prices.empty:
-        st.warning("No se pudieron descargar precios para el candidato. " + ("Fallas: "+", ".join(failed) if failed else "")); st.stop()
+        st.warning("No se pudieron descargar precios para el candidato. " + ("Fallas: " + ", ".join(failed) if failed else ""))
+        st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    mode = st.radio("Forma de evaluación", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
+    alloc_mode = st.radio("Forma de evaluación", ["Asignar porcentaje", "Añadir acciones"], horizontal=True)
 
-    last_map,_ = last_prices_resilient([tkr], source_pref=st.session_state["data_source"])
-    last=last_map.get(tkr,np.nan)
-    if np.isnan(last): st.warning("Ticker inválido o sin precio reciente."); st.stop()
+    last_map, _ = last_prices_resilient([tkr], source_pref=st.session_state.get("data_source", "Auto"))
+    last = last_map.get(tkr, np.nan)
+    if np.isnan(last):
+        st.warning("Ticker inválido o sin precio reciente.")
+        st.stop()
 
-    if mode=="Asignar porcentaje":
-        pct=st.slider("Peso objetivo del candidato",0.0,0.40,0.10,0.01)
-        w_new=(w_cur*(1-pct)).reindex(all_tickers).fillna(0.0); w_new[tkr]+=pct
+    if alloc_mode == "Asignar porcentaje":
+        pct = st.slider("Peso objetivo del candidato", 0.0, 0.40, 0.10, 0.01)
+        w_new = (w_cur * (1 - pct)).reindex(all_tickers).fillna(0.0)
+        w_new[tkr] += pct
     else:
-        qty=st.number_input("Acciones a comprar (simulado)",min_value=1,value=5,step=1)
-        pv=pos_df["MarketValue"].sum(); add=qty*last; base=pv+add if (pv+add)>0 else 1.0
-        w_new=(w_cur*pv)/base; w_new=w_new.reindex(all_tickers).fillna(0.0); w_new[tkr]+=add/base
+        qty = st.number_input("Acciones a comprar (simulado)", min_value=1, value=5, step=1)
+        pv = pos_df["MarketValue"].sum()
+        add_value = qty * last
+        base = pv + add_value if (pv + add_value) > 0 else 1.0
+        w_new = (w_cur * pv) / base
+        w_new = w_new.reindex(all_tickers).fillna(0.0)
+        w_new[tkr] += add_value / base
 
-    port_cur,_=const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
-    port_new,assets_new=const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
+    # Retornos
+    port_cur, _ = const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
+    port_new, assets_new = const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
 
-    c=st.columns(4)
-    sh_old=sharpe(port_cur,rf); sh_new=sharpe(port_new,rf)
-    c[0].metric("Sharpe actual", f"{(sh_old or 0):.2f}")
-    c[1].metric("Sharpe con candidato", f"{(sh_new or 0):.2f}", delta=f"{((sh_new or 0)-(sh_old or 0)):.2f}")
-    cum_cur=(1+port_cur).cumprod() if not port_cur.empty else pd.Series(dtype=float)
-    cum_new=(1+port_new).cumprod() if not port_new.empty else pd.Series(dtype=float)
-    mdd_cur=max_drawdown(cum_cur) if not cum_cur.empty else np.nan
-    mdd_new=max_drawdown(cum_new) if not cum_new.empty else np.nan
-    c[2].metric("MDD actual", f"{(mdd_cur or 0)*100:,.2f}%")
-    c[3].metric("MDD con candidato", f"{(mdd_new or 0)*100:,.2f}%", delta=f"{(((mdd_new or 0)-(mdd_cur or 0))*100):.2f}%")
+    # Métricas (protegidas contra NaN)
+    sh_old = sharpe(port_cur, rf)
+    sh_new = sharpe(port_new, rf)
+    cum_cur = (1 + port_cur).cumprod() if not port_cur.empty else pd.Series(dtype=float)
+    cum_new = (1 + port_new).cumprod() if not port_new.empty else pd.Series(dtype=float)
+    mdd_cur = max_drawdown(cum_cur) if not cum_cur.empty else np.nan
+    mdd_new = max_drawdown(cum_new) if not cum_new.empty else np.nan
 
-    rho=np.nan
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sharpe actual", f"{(sh_old or 0):.2f}")
+    c2.metric("Sharpe con candidato", f"{(sh_new or 0):.2f}",
+              delta=None if (pd.isna(sh_old) or pd.isna(sh_new)) else f"{(sh_new - sh_old):.2f}")
+    c3.metric("MDD actual", f"{(0 if pd.isna(mdd_cur) else mdd_cur)*100:,.2f}%")
+    c4.metric("MDD con candidato", f"{(0 if pd.isna(mdd_new) else mdd_new)*100:,.2f}%",
+              delta=None if (pd.isna(mdd_cur) or pd.isna(mdd_new)) else f"{((mdd_new - mdd_cur)*100):.2f}%")
+
+    # Correlación candidato vs cartera
+    rho = np.nan
     if tkr in assets_new.columns and not port_cur.empty:
-        rho=assets_new[tkr].corr(port_cur.reindex(assets_new.index))
-        if not np.isnan(rho): st.caption(f"Correlación candidato vs. cartera: **{rho:.2f}**")
+        rho = assets_new[tkr].corr(port_cur.reindex(assets_new.index))
+        if not np.isnan(rho):
+            st.caption(f"Correlación candidato vs. cartera: **{rho:.2f}**")
 
-    delta_sh=(sh_new or np.nan)-(sh_old or np.nan)
-    pass_rule=( (not np.isnan(delta_sh) and delta_sh>=0.03)
-                and (not np.isnan(mdd_cur) and not np.isnan(mdd_new) and (mdd_new-mdd_cur)>=-0.02)
-                and (np.isnan(rho) or rho<=0.75) )
-    st.success("✅ Recomendación positiva.") if pass_rule else st.warning("⚠️ La mejora no supera los umbrales definidos.")
+    # Regla de decisión (umbral simple)
+    delta_sharpe = (sh_new if not pd.isna(sh_new) else np.nan) - (sh_old if not pd.isna(sh_old) else np.nan)
+    pass_rule = (
+        (not pd.isna(delta_sharpe) and delta_sharpe >= 0.03)
+        and (not pd.isna(mdd_cur) and not pd.isna(mdd_new) and (mdd_new - mdd_cur) >= -0.02)
+        and (pd.isna(rho) or rho <= 0.75)
+    )
+
+    # 👇 Importante: if/else explícito (sin operador ternario) para evitar el bug de Streamlit
+    if pass_rule:
+        st.success("✅ Recomendación positiva.")
+    else:
+        st.warning("⚠️ La mejora no supera los umbrales definidos.")
 
     with st.expander("Registrar compra simulada en Transactions"):
         if st.button("Registrar (Buy)"):
-            today=datetime.utcnow().date().strftime("%Y-%m-%d")
-            write_sheet_append("Transactions",[tkr,today,"Buy",(5 if mode=='Añadir acciones' else 0), last, 0.0,"Evaluación aprobada"])
+            today = datetime.utcnow().date().strftime("%Y-%m-%d")
+            qty_to_log = 5 if alloc_mode == "Añadir acciones" else 0
+            write_sheet_append("Transactions", [tkr, today, "Buy", qty_to_log, last, 0.0, "Evaluación aprobada"])
             st.success("Operación registrada.")
-
+            
 # ================== EXPLORAR ==================
 elif page=="Explorar / Research":
     st.title("🔎 Explorar / Research")
