@@ -1,21 +1,28 @@
-# 📊 Consulta de Acciones – MODELO FINANCIERO GASCON
+# Finanzas – Portafolio Activo (Streamlit)
 
-Mini app en **Streamlit** que:
-- Consulta datos de una acción usando **YFinance**.
-- Traduce la descripción con **Gemini (Google AI Studio)**.
-- Muestra una **gráfica de velas (candlestick)** interactiva con **Plotly** y volumen.
-- Selector de periodos: **1 semana, 1 mes, 6 meses, YTD, 1 año, 3 años, 5 años**.
+App de portafolios orientada a estudiantes de finanzas:
+- **Home (Mi Portafolio)**: KPIs, asignación, crecimiento y sugerencias.
+- **Optimizar y Rebalancear**: Markowitz + tabla de “órdenes sugeridas”.
+- **Evaluar Candidato**: impacto (ΔSharpe, Δvol, ΔMDD, correlaciones) con explicación.
+- **Explorar / Research**: velas + SMAs y resumen traducido con Gemini.
+- **Herramientas**: β/α, CAPM, Monte Carlo.
 
----
+## 1) Secrets
+En **Streamlit Cloud** o local, define en `st.secrets`:
 
-## 🚀 Instalación local
-
-```bash
-git clone https://github.com/<tu-usuario>/<tu-repo>.git
-cd <tu-repo>
-
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-pip install -r requirements.txt
+```toml
+# .streamlit/secrets.toml (o en el panel de Secrets de Streamlit Cloud)
+SHEET_ID = "TU_SHEET_ID"         # ID del Google Sheets
+GEMINI_API_KEY = "opcional"      # Para traducción / resumen
+[gcp_service_account]
+type = "service_account"
+project_id = "XXXX"
+private_key_id = "XXXX"
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "xxxx@xxxx.iam.gserviceaccount.com"
+client_id = "XXXX"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/xxxx.iam.gserviceaccount.com"
 
