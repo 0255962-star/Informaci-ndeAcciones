@@ -6,9 +6,10 @@ plotly==5.22.0
 
 yfinance==0.2.43
 pandas-datareader==0.10.0
+lxml==5.3.0
 
 gspread==6.1.2
 google-auth==2.33.0
 
-xlsxwriter==3.2.0        # para exportar Excel local (opcional en cloud)
-google-generativeai==0.7.2  # opcional; sólo si usarás Gemini
+xlsxwriter==3.2.0
+google-generativeai==0.7.2   # si NO usarás Gemini, bórrala
