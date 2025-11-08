@@ -1,11 +1,12 @@
 # app.py
-# APP Finanzas – Portafolio Activo (versión robusta con fallback Stooq .US y proxy SPY para ^GSPC)
-# - Tabla estilo broker: Avg Buy, Last, P/L $, P/L% compra, Δ% ventana, Peso, Valor
-# - Capa de precios resiliente (Yahoo batch -> Yahoo per-ticker -> Stooq con mapeo .US y proxy benchmark)
-# - Optimización continúa con los tickers que sí tengan datos (excluye fallidos)
-# - Conexión a Google Sheets (Transactions / Settings / Watchlist)
+# APP Finanzas – Portafolio Activo (solo Yahoo Finance)
+# - TODAS las series de precios se descargan únicamente con yfinance
+# - Batch via yfinance.Tickers().history  →  per-ticker via yfinance.download  →  objeto Ticker().history
+# - Sin Stooq, sin Google Sheets de precios (solo usamos Sheets para Transactions/Settings/Watchlist)
+# - Optimización continúa con los tickers que sí tengan datos (excluye fallidos), sin mezclar proveedores
 
 from datetime import datetime, timedelta
+import time
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -37,12 +38,9 @@ div[data-testid="stMetricValue"]{font-size:1.6rem}
 
 # ============== SECRETS / GSHEETS ==============
 SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
 GCP_SA = st.secrets.get("gcp_service_account", {})
-
 if not SHEET_ID or not GCP_SA:
-    st.error("Faltan secretos: `SHEET_ID` y/o `gcp_service_account`.")
-    st.stop()
+    st.error("Faltan secretos: `SHEET_ID` y/o `gcp_service_account`."); st.stop()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
 credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
@@ -50,20 +48,19 @@ gc = gspread.authorize(credentials)
 
 # ============== CACHE HELPERS ==============
 def refresh_data():
-    try: read_sheet.clear()
-    except Exception: pass
-    try: load_all_data.clear()
-    except Exception: pass
+    for f in (read_sheet, load_all_data, fetch_prices_yf, last_prices_yf):
+        try: f.clear()
+        except Exception: pass
     try: st.cache_data.clear()
     except Exception: pass
 
-@st.cache_data(show_spinner=False, ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def read_sheet(name:str)->pd.DataFrame:
     sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
     return pd.DataFrame(ws.get_all_records())
 
-# ============== LOAD SHEETS (tolerante a columnas) ==============
-@st.cache_data(show_spinner=False, ttl=600)
+# ============== LOAD SHEETS =====================
+@st.cache_data(ttl=600, show_spinner=False)
 def load_all_data():
     def safe(name, cols):
         try:
@@ -91,162 +88,150 @@ def get_setting(settings_df, key, default=None, cast=float):
     except Exception:
         return default
 
-# ============== CAPA DE PRECIOS ROBUSTA (con mapeo .US y proxy SPY) =========================
+# ============== SOLO YAHOO FINANCE =========================
 def _clean_tickers(tickers):
-    uniq = []
+    uniq=[]
     for t in tickers:
         if not isinstance(t,str): continue
-        t2 = t.upper().strip().replace(" ", "")
+        t2=t.upper().strip().replace(" ","")
         if t2 and t2 not in uniq: uniq.append(t2)
     return uniq
 
 def _to_close_frame(df_like, name=None):
-    if df_like is None or len(df_like) == 0:
-        return pd.DataFrame()
-    if "Close" in df_like:
-        close = df_like["Close"]
-    else:
-        close = df_like
+    if df_like is None or len(df_like)==0: return pd.DataFrame()
+    if "Close" in df_like: close=df_like["Close"]
+    else: close=df_like
     if isinstance(close, pd.Series):
-        close = close.to_frame(name or close.name or "Close")
-    if hasattr(close, "columns") and isinstance(close.columns, pd.MultiIndex):
-        close.columns = [c[-1] if isinstance(c, tuple) else c for c in close.columns]
+        close=close.to_frame(name or close.name or "Close")
+    if hasattr(close,"columns") and isinstance(close.columns, pd.MultiIndex):
+        close.columns=[c[-1] if isinstance(c,tuple) else c for c in close.columns]
     return close
 
-def _stooq_symbol_for(t: str) -> str:
-    # Stooq usa sufijo .US para la mayoría de acciones/ETFs de USA
-    if t.startswith("^"):
-        # reemplazo de índice: ^GSPC ~ SPY.US como proxy
-        return "SPY.US"
-    # si ya trae un sufijo (p.ej. .US), respeta
-    if "." in t:
-        return t
-    return f"{t}.US"
-
-@st.cache_data(show_spinner=False, ttl=900)
-def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_pref="Auto"):
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_prices_yf(tickers, start=None, end=None, interval="1d", max_retries=2, pause_sec=0.8):
     """
-    Devuelve (precios_df, fallidos). Pipeline:
-    1) Yahoo batch
-    2) Yahoo por ticker
-    3) Stooq con mapeo .US (y ^GSPC -> SPY.US)
+    Descarga SOLO con yfinance. Devuelve (prices_df, fallidos).
+    1) batch yfinance.Tickers().history()
+    2) por ticker via yfinance.download()
+    3) último recurso: yfinance.Ticker(t).history()
     """
     tickers = _clean_tickers(tickers)
-    if not tickers:
-        return pd.DataFrame(), []
+    if not tickers: return pd.DataFrame(), []
 
-    # batch (rápido) con yfinance.Tickers().history()
-    def try_batch_yf(tks):
+    # 1) batch
+    def try_batch(tks):
         try:
-            yh = yf.Tickers(" ".join(tks))
+            yh=yf.Tickers(" ".join(tks))
             if start is None and end is None:
-                h = yh.history(period="max", interval=interval, auto_adjust=True)
+                h=yh.history(period="max", interval=interval, auto_adjust=True)
             else:
-                h = yh.history(start=start, end=end, interval=interval, auto_adjust=True)
-            close = _to_close_frame(h)
+                h=yh.history(start=start, end=end, interval=interval, auto_adjust=True)
+            close=_to_close_frame(h)
             if not close.empty:
-                keep = [c for c in close.columns if c in tks]
+                keep=[c for c in close.columns if c in tks]
                 return close[keep]
         except Exception:
             pass
         return pd.DataFrame()
 
-    # per-ticker (con más fallback)
-    def try_one_yf(t):
+    # 2) per-ticker download
+    def try_download(t):
         try:
-            if start is None and end is None:
-                d = yf.download(t, period="max", interval=interval, auto_adjust=True, progress=False)
-            else:
-                d = yf.download(t, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
-            d = _to_close_frame(d, name=t).dropna(how="all")
+            d=yf.download(
+                t,
+                period=None if (start or end) else "max",
+                start=start, end=end, interval=interval,
+                auto_adjust=True, progress=False, group_by="column", threads=True
+            )
+            d=_to_close_frame(d, name=t).dropna(how="all")
             if not d.empty:
-                if t not in d.columns and d.shape[1] == 1:
-                    d.columns = [t]
+                if t not in d.columns and d.shape[1]==1: d.columns=[t]
                 return d[[t]]
-            # último recurso con objeto Ticker
-            h = yf.Ticker(t).history(period="max", auto_adjust=True)
-            if not h.empty and "Close" in h:
-                h = h[["Close"]].rename(columns={"Close": t})
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    # 3) objeto Ticker().history
+    def try_history_obj(t):
+        try:
+            th=yf.Ticker(t).history(period="max", auto_adjust=True)
+            if not th.empty and "Close" in th:
+                th=th[["Close"]].rename(columns={"Close":t})
                 if start or end:
                     s = pd.to_datetime(start) if start else pd.Timestamp.min
                     e = pd.to_datetime(end) if end else pd.Timestamp.max
-                    h = h.loc[(h.index >= s) & (h.index <= e)]
-                return h
+                    th=th.loc[(th.index>=s)&(th.index<=e)]
+                return th
         except Exception:
             pass
         return pd.DataFrame()
 
-    def try_one_stooq(t):
-        try:
-            import pandas_datareader.data as pdr
-            sym = _stooq_symbol_for(t)
-            s = pd.to_datetime(start) if start else (datetime.utcnow()-timedelta(days=365*5))
-            e = pd.to_datetime(end) if end else datetime.utcnow()
-            df = pdr.DataReader(sym, "stooq", start=s, end=e)
-            if df is not None and not df.empty and "Close" in df:
-                return df.sort_index()[["Close"]].rename(columns={"Close": t})
-        except Exception:
-            pass
-        return pd.DataFrame()
+    frames=[]
+    prices_batch=try_batch(tickers)
+    if not prices_batch.empty:
+        frames.append(prices_batch)
 
-    # 1) Yahoo batch
-    prices = try_batch_yf(tickers)
-    got = set(prices.columns) if not prices.empty else set()
-    missing = [t for t in tickers if t not in got]
+    got=set(pd.concat(frames,axis=1).columns) if frames else set()
+    missing=[t for t in tickers if t not in got]
 
-    # 2) Yahoo per ticker
-    per_ticker_frames = []
+    # per-ticker con reintentos suaves
     for t in missing:
-        d = try_one_yf(t)
-        if not d.empty:
-            per_ticker_frames.append(d)
+        df_tick=pd.DataFrame()
+        for k in range(max_retries+1):
+            df_tick=try_download(t)
+            if not df_tick.empty: break
+            time.sleep(pause_sec*(k+1))
+        if df_tick.empty:
+            # history objeto
+            for k in range(max_retries+1):
+                df_tick=try_history_obj(t)
+                if not df_tick.empty: break
+                time.sleep(pause_sec*(k+1))
+        if not df_tick.empty:
+            frames.append(df_tick)
 
-    # 3) Stooq .US para los que sigan faltando
-    still_missing = [t for t in missing if t not in (set([c for df in per_ticker_frames for c in df.columns]))]
-    for t in still_missing:
-        d = try_one_stooq(t)
-        if not d.empty:
-            per_ticker_frames.append(d)
-
-    if not prices.empty or per_ticker_frames:
-        frames = []
-        if not prices.empty: frames.append(prices)
-        if per_ticker_frames: frames += per_ticker_frames
-        out = pd.concat(frames, axis=1).sort_index()
-        out = out.loc[:, out.notna().any()]
-        failed = [t for t in tickers if t not in out.columns]
+    if frames:
+        out=pd.concat(frames,axis=1).sort_index()
+        out=out.loc[:, out.notna().any()]
+        failed=[t for t in tickers if t not in out.columns]
         return out, failed
-
     return pd.DataFrame(), tickers
 
-@st.cache_data(show_spinner=False, ttl=600)
-def last_prices_resilient(tickers, source_pref="Auto"):
-    tickers = _clean_tickers(tickers)
-    ok, failed = {}, []
-    for t in tickers:
-        px = np.nan
-        # YF
+@st.cache_data(ttl=600, show_spinner=False)
+def last_prices_yf(tickers, max_retries=2, pause_sec=0.6):
+    tickers=_clean_tickers(tickers)
+    ok, failed={}, []
+
+    def add_from_df(t, df):
         try:
-            d = yf.download(t, period="7d", interval="1d", auto_adjust=True, progress=False)
-            c = _to_close_frame(d, name=t).ffill()
+            c=_to_close_frame(df, name=t).ffill()
             if not c.empty:
-                px = float(c.iloc[-1,0])
+                ok[t]=float(c.iloc[-1,0]); return True
         except Exception:
             pass
-        # Stooq fallback (.US)
-        if (np.isnan(px)) and (source_pref in ("Auto","Stooq")):
+        return False
+
+    for t in tickers:
+        success=False
+        # download corto
+        for k in range(max_retries+1):
             try:
-                import pandas_datareader.data as pdr
-                sym = _stooq_symbol_for(t)
-                s = datetime.utcnow()-timedelta(days=14)
-                e = datetime.utcnow()
-                df = pdr.DataReader(sym, "stooq", start=s, end=e)
-                if df is not None and not df.empty and "Close" in df:
-                    px = float(df.sort_index()["Close"].iloc[-1])
+                d=yf.download(t, period="10d", interval="1d", auto_adjust=True, progress=False)
+                if add_from_df(t, d): success=True; break
             except Exception:
                 pass
-        if np.isnan(px): failed.append(t)
-        else: ok[t] = px
+            time.sleep(pause_sec*(k+1))
+        # objeto history
+        if not success:
+            for k in range(max_retries+1):
+                try:
+                    h=yf.Ticker(t).history(period="10d", auto_adjust=True)
+                    if add_from_df(t, h): success=True; break
+                except Exception:
+                    pass
+                time.sleep(pause_sec*(k+1))
+        if not success: failed.append(t)
+
     return ok, failed
 
 # ============== MÉTRICAS =========================
@@ -282,14 +267,12 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
               "GrossAmount","NetAmount","LotID","Source","Notes"]:
         if c not in df.columns: df[c]=np.nan
-
     df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
     df=df.dropna(subset=["Ticker"])
     df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
     for n in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
         df[n]=pd.to_numeric(df[n],errors="coerce")
     df["FXRate"]=df["FXRate"].fillna(1.0)
-
     def signed(row):
         s=str(row.get("Side","")).lower().strip()
         q=float(row.get("Shares",0) or 0)
@@ -305,8 +288,7 @@ def positions_from_tx(tx:pd.DataFrame):
     uniq=sorted(df["Ticker"].unique().tolist())
     if not uniq:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-
-    last_map, failed_lp = last_prices_resilient(uniq, source_pref=st.session_state.get("data_source","Auto"))
+    last_map, failed_lp = last_prices_yf(uniq)
     pos=[]
     for t,grp in df.groupby("Ticker"):
         sh=float(grp["SignedShares"].sum())
@@ -326,7 +308,7 @@ def positions_from_tx(tx:pd.DataFrame):
         pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
         pos.append([t,sh,avg,inv,px,mv,pl])
     dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    if failed_lp: st.caption("⚠️ Sin precio reciente para: " + ", ".join(failed_lp))
+    if failed_lp: st.caption("⚠️ Sin precio reciente (Yahoo): " + ", ".join(failed_lp))
     return dfp.sort_values("MarketValue",ascending=False)
 
 def weights_from_positions(pos_df:pd.DataFrame):
@@ -362,9 +344,10 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
     res=minimize(neg_sharpe,x0,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":500})
     return res.x if (hasattr(res,"success") and res.success) else x0
 
-# ============== LOAD BASE ====================
+# ============== BASE ====================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
+# Sugerencia de Sheets: en Settings, deja Benchmark="^GSPC" (índice S&P 500 oficial en Yahoo)
 benchmark = get_setting(settings_df,"Benchmark","^GSPC",str)
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
@@ -373,54 +356,34 @@ w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
 st.sidebar.title("📊 Navegación")
 page = st.sidebar.radio("Ir a:", ["Mi Portafolio","Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Herramientas"])
 window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"], index=2)
-data_source = st.sidebar.selectbox("Fuente de precios", ["Auto","Yahoo!","Stooq"], index=0)
-st.session_state["data_source"] = "Auto" if data_source=="Auto" else ("Yahoo" if data_source=="Yahoo!" else "Stooq")
 
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
-# ============== HOME / BROKER-LIKE TABLE =====
+# ============== HOME ===========================
 if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
-
-    if st.button("🔄 Refrescar datos"):
-        refresh_data(); st.rerun()
+    if st.button("🔄 Refrescar datos"): refresh_data(); st.rerun()
 
     pos_df = positions_from_tx(tx_df)
-    if pos_df.empty:
-        st.info("No hay posiciones aún. Carga operaciones en **Transactions**.")
-        st.stop()
+    if pos_df.empty: st.info("No hay posiciones aún."); st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-
-    # Primer intento: Auto (Yahoo→Stooq)
-    prices, failed = fetch_prices_resilient(tickers + [benchmark], start=start_date, source_pref=st.session_state["data_source"])
+    # Descarga histórica SOLO con Yahoo
+    prices, failed = fetch_prices_yf(tickers + [benchmark], start=start_date)
 
     bench_ret = pd.Series(dtype=float)
-    # Si benchmark vino vacío, usa SPY/SPY.US como proxy
     if not prices.empty and benchmark in prices.columns:
         bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
         prices = prices.drop(columns=[benchmark], errors="ignore")
-    else:
-        spy_try, _ = fetch_prices_resilient(["SPY"], start=start_date, source_pref="Yahoo")
-        if spy_try.empty:
-            spy_try, _ = fetch_prices_resilient(["SPY"], start=start_date, source_pref="Stooq")
-        if not spy_try.empty and "SPY" in spy_try.columns:
-            bench_ret = spy_try["SPY"].pct_change().dropna()
-
-    # Si nada funcionó, reintenta forzando Stooq para todos
-    if (prices.empty or len(prices.columns)==0):
-        prices2, failed2 = fetch_prices_resilient(tickers, start=start_date, source_pref="Stooq")
-        if not prices2.empty:
-            prices, failed = prices2, failed2
 
     failed_set=set(failed)
     if prices.empty or len(prices.columns)==0:
-        msg="No se pudieron obtener precios históricos."
+        msg="No se pudieron obtener precios históricos desde Yahoo."
         if failed_set: msg += " Fallidos: " + ", ".join(sorted(failed_set))
         st.warning(msg); st.stop()
     if failed_set:
-        st.caption("⚠️ Tickers sin histórico: " + ", ".join(sorted(failed_set)))
+        st.caption("⚠️ Tickers sin histórico (Yahoo): " + ", ".join(sorted(failed_set)))
 
     # Retornos por activo (ventana)
     asset_rets = prices.pct_change().dropna(how="all")
@@ -484,33 +447,23 @@ if page=="Mi Portafolio":
 
     st.subheader("📋 Detalle de posiciones (estilo broker)")
     st.dataframe(styled, use_container_width=True, height=min(600, 120 + 32*len(view)))
+    st.download_button("⬇️ Descargar posiciones (CSV)", view.to_csv(index=False).encode("utf-8"),
+                       file_name="mi_portafolio.csv", mime="text/csv")
 
-    # Descargar CSV
-    csv = view.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar posiciones (CSV)", csv, file_name="mi_portafolio.csv", mime="text/csv")
-
-# ============== OPTIMIZAR (tolerante a fallas y reintento Stooq) ===========
+# ============== OPTIMIZAR (solo Yahoo) =========================
 elif page=="Optimizar y Rebalancear":
     st.title("🛠️ Optimizar y Rebalancear")
     pos_df = positions_from_tx(tx_df)
-    if pos_df.empty:
-        st.info("No hay posiciones."); st.stop()
+    if pos_df.empty: st.info("No hay posiciones."); st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-
-    # 1) Yahoo
-    prices, failed = fetch_prices_resilient(tickers, start=start_date, source_pref="Yahoo")
-
-    # 2) Si no hay nada aún, reintenta con Stooq (.US)
-    if prices.empty:
-        prices, failed = fetch_prices_resilient(tickers, start=start_date, source_pref="Stooq")
+    prices, failed = fetch_prices_yf(tickers, start=start_date)
 
     if prices.empty:
-        st.warning("No hay precios para optimizar. " + (", ".join(failed) if failed else ""))
-        st.stop()
+        st.warning("No hay precios para optimizar desde Yahoo. " + (", ".join(failed) if failed else "")); st.stop()
 
     if failed:
-        st.caption("⚠️ Excluidos por falta de histórico: " + ", ".join(sorted(failed)))
+        st.caption("⚠️ Excluidos por falta de histórico (Yahoo): " + ", ".join(sorted(failed)))
         good = [c for c in prices.columns if prices[c].notna().any()]
         prices = prices[good]
         pos_df = pos_df[pos_df["Ticker"].isin(good)].copy()
@@ -519,12 +472,9 @@ elif page=="Optimizar y Rebalancear":
     w_cur = weights_from_positions(pos_df)
     port_ret_cur, asset_rets = const_weight_returns(prices, w_cur)
     if asset_rets.empty:
-        st.warning("No hay retornos suficientes para optimizar.")
-        st.stop()
+        st.warning("No hay retornos suficientes para optimizar."); st.stop()
 
     mean_daily=asset_rets.mean(); cov=asset_rets.cov(); mu_ann=(1+mean_daily)**252-1
-    w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
-    w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
     bounds=[(w_min,w_max)]*len(tickers)
     w_opt = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
     w_opt = pd.Series(w_opt, index=tickers).clip(lower=w_min, upper=w_max); w_opt/=w_opt.sum()
@@ -540,7 +490,7 @@ elif page=="Optimizar y Rebalancear":
     compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
     st.dataframe(compare.style.format({"Weight Actual":"{:.2%}","Weight Propuesto":"{:.2%}","Δ (pp)":"{:.2f}"}), use_container_width=True)
 
-# ============== EVALUAR CANDIDATO ==================
+# ============== EVALUAR CANDIDATO (solo Yahoo) ==================
 elif page=="Evaluar Candidato":
     st.title("🧪 Evaluar Candidato")
     pos_df = positions_from_tx(tx_df)
@@ -549,14 +499,14 @@ elif page=="Evaluar Candidato":
     tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
     if not tkr: st.stop()
     tickers = pos_df["Ticker"].tolist()
-    prices, failed = fetch_prices_resilient(sorted(set(tickers+[tkr])), start=start_date, source_pref=st.session_state["data_source"])
+    prices, failed = fetch_prices_yf(sorted(set(tickers+[tkr])), start=start_date)
     if prices.empty:
-        st.warning("No se pudieron descargar precios. "+(", ".join(failed) if failed else "")); st.stop()
+        st.warning("No se pudieron descargar precios desde Yahoo. "+(", ".join(failed) if failed else "")); st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    last_map,_ = last_prices_resilient([tkr], source_pref=st.session_state["data_source"])
+    last_map,_ = last_prices_yf([tkr])
     last=last_map.get(tkr,np.nan)
-    if np.isnan(last): st.warning("Ticker inválido o sin precio reciente."); st.stop()
+    if np.isnan(last): st.warning("Ticker inválido o sin precio reciente (Yahoo)."); st.stop()
 
     mode = st.radio("Forma de evaluación", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
     if mode=="Asignar porcentaje":
@@ -585,11 +535,17 @@ elif page=="Explorar / Research":
     st.title("🔎 Explorar / Research")
     tkr=st.text_input("Ticker", value="MSFT").upper().strip().replace(" ","")
     if tkr:
-        hist=yf.download(tkr,period="1y",interval="1d",auto_adjust=True,progress=False)
-        if not hist.empty:
-            fig=go.Figure(data=[go.Candlestick(x=hist.index,open=hist["Open"],high=hist["High"],low=hist["Low"],close=hist["Close"])])
-            fig.update_layout(title=f"Velas: {tkr}", xaxis_rangeslider_visible=False, height=480)
-            st.plotly_chart(fig, use_container_width=True)
+        hist, _ = fetch_prices_yf([tkr], start=start_date)
+        if not hist.empty and tkr in hist.columns:
+            ser = hist[tkr].dropna()
+            if not ser.empty:
+                df = pd.DataFrame({"Close": ser})
+                fig=go.Figure(data=[go.Candlestick(
+                    x=df.index,
+                    open=df["Close"], high=df["Close"], low=df["Close"], close=df["Close"]
+                )])
+                fig.update_layout(title=f"Serie (Close) {tkr}", xaxis_rangeslider_visible=False, height=480)
+                st.plotly_chart(fig, use_container_width=True)
 
 # ============== HERRAMIENTAS =====================
 elif page=="Herramientas":
