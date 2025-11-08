@@ -1,7 +1,7 @@
 # app.py
-# APP Finanzas – Portafolio Activo (versión robusta)
+# APP Finanzas – Portafolio Activo (versión robusta con fallback Stooq .US y proxy SPY para ^GSPC)
 # - Tabla estilo broker: Avg Buy, Last, P/L $, P/L% compra, Δ% ventana, Peso, Valor
-# - Capa de precios resiliente (Yahoo batch -> Yahoo per-ticker -> Stooq)
+# - Capa de precios resiliente (Yahoo batch -> Yahoo per-ticker -> Stooq con mapeo .US y proxy benchmark)
 # - Optimización continúa con los tickers que sí tengan datos (excluye fallidos)
 # - Conexión a Google Sheets (Transactions / Settings / Watchlist)
 
@@ -91,7 +91,7 @@ def get_setting(settings_df, key, default=None, cast=float):
     except Exception:
         return default
 
-# ============== CAPA DE PRECIOS ROBUSTA =========================
+# ============== CAPA DE PRECIOS ROBUSTA (con mapeo .US y proxy SPY) =========================
 def _clean_tickers(tickers):
     uniq = []
     for t in tickers:
@@ -113,9 +113,24 @@ def _to_close_frame(df_like, name=None):
         close.columns = [c[-1] if isinstance(c, tuple) else c for c in close.columns]
     return close
 
+def _stooq_symbol_for(t: str) -> str:
+    # Stooq usa sufijo .US para la mayoría de acciones/ETFs de USA
+    if t.startswith("^"):
+        # reemplazo de índice: ^GSPC ~ SPY.US como proxy
+        return "SPY.US"
+    # si ya trae un sufijo (p.ej. .US), respeta
+    if "." in t:
+        return t
+    return f"{t}.US"
+
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_pref="Auto"):
-    """Devuelve (precios_df, fallidos). Si algunos fallan, continúa con el resto."""
+    """
+    Devuelve (precios_df, fallidos). Pipeline:
+    1) Yahoo batch
+    2) Yahoo por ticker
+    3) Stooq con mapeo .US (y ^GSPC -> SPY.US)
+    """
     tickers = _clean_tickers(tickers)
     if not tickers:
         return pd.DataFrame(), []
@@ -130,7 +145,7 @@ def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_
                 h = yh.history(start=start, end=end, interval=interval, auto_adjust=True)
             close = _to_close_frame(h)
             if not close.empty:
-                keep = [c for c in close.columns if c in tickers]
+                keep = [c for c in close.columns if c in tks]
                 return close[keep]
         except Exception:
             pass
@@ -148,7 +163,7 @@ def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_
                 if t not in d.columns and d.shape[1] == 1:
                     d.columns = [t]
                 return d[[t]]
-            # último recurso: history del objeto Ticker
+            # último recurso con objeto Ticker
             h = yf.Ticker(t).history(period="max", auto_adjust=True)
             if not h.empty and "Close" in h:
                 h = h[["Close"]].rename(columns={"Close": t})
@@ -164,24 +179,32 @@ def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_
     def try_one_stooq(t):
         try:
             import pandas_datareader.data as pdr
+            sym = _stooq_symbol_for(t)
             s = pd.to_datetime(start) if start else (datetime.utcnow()-timedelta(days=365*5))
             e = pd.to_datetime(end) if end else datetime.utcnow()
-            df = pdr.DataReader(t, "stooq", start=s, end=e)
+            df = pdr.DataReader(sym, "stooq", start=s, end=e)
             if df is not None and not df.empty and "Close" in df:
                 return df.sort_index()[["Close"]].rename(columns={"Close": t})
         except Exception:
             pass
         return pd.DataFrame()
 
+    # 1) Yahoo batch
     prices = try_batch_yf(tickers)
     got = set(prices.columns) if not prices.empty else set()
     missing = [t for t in tickers if t not in got]
 
+    # 2) Yahoo per ticker
     per_ticker_frames = []
     for t in missing:
         d = try_one_yf(t)
-        if d.empty and (source_pref in ("Auto","Stooq")):
-            d = try_one_stooq(t)
+        if not d.empty:
+            per_ticker_frames.append(d)
+
+    # 3) Stooq .US para los que sigan faltando
+    still_missing = [t for t in missing if t not in (set([c for df in per_ticker_frames for c in df.columns]))]
+    for t in still_missing:
+        d = try_one_stooq(t)
         if not d.empty:
             per_ticker_frames.append(d)
 
@@ -190,11 +213,10 @@ def fetch_prices_resilient(tickers, start=None, end=None, interval="1d", source_
         if not prices.empty: frames.append(prices)
         if per_ticker_frames: frames += per_ticker_frames
         out = pd.concat(frames, axis=1).sort_index()
-        out = out.loc[:, out.notna().any()]  # quita columnas completamente vacías
+        out = out.loc[:, out.notna().any()]
         failed = [t for t in tickers if t not in out.columns]
         return out, failed
 
-    # si absolutamente todo falla
     return pd.DataFrame(), tickers
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -211,13 +233,14 @@ def last_prices_resilient(tickers, source_pref="Auto"):
                 px = float(c.iloc[-1,0])
         except Exception:
             pass
-        # Stooq fallback
+        # Stooq fallback (.US)
         if (np.isnan(px)) and (source_pref in ("Auto","Stooq")):
             try:
                 import pandas_datareader.data as pdr
+                sym = _stooq_symbol_for(t)
                 s = datetime.utcnow()-timedelta(days=14)
                 e = datetime.utcnow()
-                df = pdr.DataReader(t, "stooq", start=s, end=e)
+                df = pdr.DataReader(sym, "stooq", start=s, end=e)
                 if df is not None and not df.empty and "Close" in df:
                     px = float(df.sort_index()["Close"].iloc[-1])
             except Exception:
@@ -369,12 +392,27 @@ if page=="Mi Portafolio":
         st.stop()
 
     tickers = pos_df["Ticker"].tolist()
+
+    # Primer intento: Auto (Yahoo→Stooq)
     prices, failed = fetch_prices_resilient(tickers + [benchmark], start=start_date, source_pref=st.session_state["data_source"])
 
     bench_ret = pd.Series(dtype=float)
+    # Si benchmark vino vacío, usa SPY/SPY.US como proxy
     if not prices.empty and benchmark in prices.columns:
         bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
         prices = prices.drop(columns=[benchmark], errors="ignore")
+    else:
+        spy_try, _ = fetch_prices_resilient(["SPY"], start=start_date, source_pref="Yahoo")
+        if spy_try.empty:
+            spy_try, _ = fetch_prices_resilient(["SPY"], start=start_date, source_pref="Stooq")
+        if not spy_try.empty and "SPY" in spy_try.columns:
+            bench_ret = spy_try["SPY"].pct_change().dropna()
+
+    # Si nada funcionó, reintenta forzando Stooq para todos
+    if (prices.empty or len(prices.columns)==0):
+        prices2, failed2 = fetch_prices_resilient(tickers, start=start_date, source_pref="Stooq")
+        if not prices2.empty:
+            prices, failed = prices2, failed2
 
     failed_set=set(failed)
     if prices.empty or len(prices.columns)==0:
@@ -451,7 +489,7 @@ if page=="Mi Portafolio":
     csv = view.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Descargar posiciones (CSV)", csv, file_name="mi_portafolio.csv", mime="text/csv")
 
-# ============== OPTIMIZAR (tolerante a fallas) ===========
+# ============== OPTIMIZAR (tolerante a fallas y reintento Stooq) ===========
 elif page=="Optimizar y Rebalancear":
     st.title("🛠️ Optimizar y Rebalancear")
     pos_df = positions_from_tx(tx_df)
@@ -460,8 +498,13 @@ elif page=="Optimizar y Rebalancear":
 
     tickers = pos_df["Ticker"].tolist()
 
-    # Fuerza Yahoo (mejor cobertura) y usa la ventana seleccionada
+    # 1) Yahoo
     prices, failed = fetch_prices_resilient(tickers, start=start_date, source_pref="Yahoo")
+
+    # 2) Si no hay nada aún, reintenta con Stooq (.US)
+    if prices.empty:
+        prices, failed = fetch_prices_resilient(tickers, start=start_date, source_pref="Stooq")
+
     if prices.empty:
         st.warning("No hay precios para optimizar. " + (", ".join(failed) if failed else ""))
         st.stop()
@@ -480,6 +523,8 @@ elif page=="Optimizar y Rebalancear":
         st.stop()
 
     mean_daily=asset_rets.mean(); cov=asset_rets.cov(); mu_ann=(1+mean_daily)**252-1
+    w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
+    w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
     bounds=[(w_min,w_max)]*len(tickers)
     w_opt = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
     w_opt = pd.Series(w_opt, index=tickers).clip(lower=w_min, upper=w_max); w_opt/=w_opt.sum()
