@@ -1,9 +1,9 @@
-# app.py
-# APP Finanzas – Portafolio Activo (solo Yahoo Finance)
-# - TODAS las series de precios se descargan únicamente con yfinance
-# - Batch via yfinance.Tickers().history  →  per-ticker via yfinance.download  →  objeto Ticker().history
-# - Sin Stooq, sin Google Sheets de precios (solo usamos Sheets para Transactions/Settings/Watchlist)
-# - Optimización continúa con los tickers que sí tengan datos (excluye fallidos), sin mezclar proveedores
+# APP Finanzas – Portafolio Activo (SOLO Yahoo Finance) + Panel de diagnóstico
+# - Descarga precios exclusivamente con yfinance
+# - Reintentos suaves y tres rutas dentro de Yahoo: batch -> por ticker -> objeto Ticker
+# - Conexión a Google Sheets para Transactions / Settings / Watchlist
+# - Panel "Diagnóstico" en la barra lateral para ver checks inmediatos
+# - Mensajes de error claros cuando falte un secret, hoja, o precio
 
 from datetime import datetime, timedelta
 import time
@@ -18,7 +18,7 @@ from scipy.optimize import minimize
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ============== LOOK & FEEL ==============
+# ============== PÁGINA / TEMA ==============
 st.set_page_config(page_title="APP Finanzas – Portafolio Activo", page_icon="💼", layout="wide")
 st.markdown("""
 <style>
@@ -31,23 +31,33 @@ st.markdown("""
   --down: #ff4d4f;
 }
 .block-container { padding-top: 0.8rem; }
+section[data-testid="stSidebar"] { border-right: 1px solid #1e2435; }
 div[data-testid="stMetricValue"]{font-size:1.6rem}
 [data-testid="stHeader"] { background: rgba(0,0,0,0); }
 </style>
 """, unsafe_allow_html=True)
 
-# ============== SECRETS / GSHEETS ==============
+# ============== SECRETS OBLIGATORIOS ==============
 SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
 GCP_SA = st.secrets.get("gcp_service_account", {})
-if not SHEET_ID or not GCP_SA:
-    st.error("Faltan secretos: `SHEET_ID` y/o `gcp_service_account`."); st.stop()
+
+if not SHEET_ID:
+    st.error("Falta el secret `SHEET_ID` (o `GSHEETS_SPREADSHEET_NAME`). Agrega el ID de tu Google Sheet en secrets.")
+    st.stop()
+if not GCP_SA:
+    st.error("Falta el bloque `gcp_service_account` en secrets (credenciales del Service Account).")
+    st.stop()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
-gc = gspread.authorize(credentials)
+try:
+    credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
+    gc = gspread.authorize(credentials)
+except Exception as e:
+    st.error(f"No pude autorizar Google Sheets. Revisa tu service account. Detalle: {e}")
+    st.stop()
 
-# ============== CACHE HELPERS ==============
-def refresh_data():
+# ============== CACHES Y UTILIDADES ==============
+def refresh_all_caches():
     for f in (read_sheet, load_all_data, fetch_prices_yf, last_prices_yf):
         try: f.clear()
         except Exception: pass
@@ -56,18 +66,21 @@ def refresh_data():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def read_sheet(name:str)->pd.DataFrame:
-    sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(name)
     return pd.DataFrame(ws.get_all_records())
 
-# ============== LOAD SHEETS =====================
 @st.cache_data(ttl=600, show_spinner=False)
 def load_all_data():
     def safe(name, cols):
         try:
             df = read_sheet(name)
-            if df.empty: return pd.DataFrame(columns=cols)
+            if df.empty:
+                return pd.DataFrame(columns=cols)
+            # asegura columnas
             for c in cols:
-                if c not in df.columns: df[c]=np.nan
+                if c not in df.columns:
+                    df[c] = np.nan
             return df
         except Exception:
             return pd.DataFrame(columns=cols)
@@ -88,7 +101,6 @@ def get_setting(settings_df, key, default=None, cast=float):
     except Exception:
         return default
 
-# ============== SOLO YAHOO FINANCE =========================
 def _clean_tickers(tickers):
     uniq=[]
     for t in tickers:
@@ -107,10 +119,11 @@ def _to_close_frame(df_like, name=None):
         close.columns=[c[-1] if isinstance(c,tuple) else c for c in close.columns]
     return close
 
+# ============== SOLO YAHOO FINANCE (robusto) ==============
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_prices_yf(tickers, start=None, end=None, interval="1d", max_retries=2, pause_sec=0.8):
+def fetch_prices_yf(tickers, start=None, end=None, interval="1d", max_retries=2, pause_sec=0.9):
     """
-    Descarga SOLO con yfinance. Devuelve (prices_df, fallidos).
+    SOLO yfinance. Devuelve (prices_df, fallidos).
     1) batch yfinance.Tickers().history()
     2) por ticker via yfinance.download()
     3) último recurso: yfinance.Ticker(t).history()
@@ -198,7 +211,7 @@ def fetch_prices_yf(tickers, start=None, end=None, interval="1d", max_retries=2,
     return pd.DataFrame(), tickers
 
 @st.cache_data(ttl=600, show_spinner=False)
-def last_prices_yf(tickers, max_retries=2, pause_sec=0.6):
+def last_prices_yf(tickers, max_retries=2, pause_sec=0.7):
     tickers=_clean_tickers(tickers)
     ok, failed={}, []
 
@@ -267,12 +280,14 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
               "GrossAmount","NetAmount","LotID","Source","Notes"]:
         if c not in df.columns: df[c]=np.nan
+
     df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
     df=df.dropna(subset=["Ticker"])
     df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
     for n in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
         df[n]=pd.to_numeric(df[n],errors="coerce")
     df["FXRate"]=df["FXRate"].fillna(1.0)
+
     def signed(row):
         s=str(row.get("Side","")).lower().strip()
         q=float(row.get("Shares",0) or 0)
@@ -288,6 +303,7 @@ def positions_from_tx(tx:pd.DataFrame):
     uniq=sorted(df["Ticker"].unique().tolist())
     if not uniq:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
+
     last_map, failed_lp = last_prices_yf(uniq)
     pos=[]
     for t,grp in df.groupby("Ticker"):
@@ -308,7 +324,7 @@ def positions_from_tx(tx:pd.DataFrame):
         pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
         pos.append([t,sh,avg,inv,px,mv,pl])
     dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    if failed_lp: st.caption("⚠️ Sin precio reciente (Yahoo): " + ", ".join(failed_lp))
+    if failed_lp: st.caption("⚠️ Sin último precio (Yahoo): " + ", ".join(failed_lp))
     return dfp.sort_values("MarketValue",ascending=False)
 
 def weights_from_positions(pos_df:pd.DataFrame):
@@ -344,17 +360,19 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
     res=minimize(neg_sharpe,x0,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":500})
     return res.x if (hasattr(res,"success") and res.success) else x0
 
-# ============== BASE ====================
+# ============== DATA BASE ==============
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
-# Sugerencia de Sheets: en Settings, deja Benchmark="^GSPC" (índice S&P 500 oficial en Yahoo)
 benchmark = get_setting(settings_df,"Benchmark","^GSPC",str)
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
 
-# ============== SIDEBAR ======================
+# ============== SIDEBAR / DIAGNÓSTICO ==============
 st.sidebar.title("📊 Navegación")
-page = st.sidebar.radio("Ir a:", ["Mi Portafolio","Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Herramientas"])
+page = st.sidebar.radio("Ir a:", [
+    "Mi Portafolio","Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Herramientas","Diagnóstico"
+])
+
 window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"], index=2)
 
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
@@ -363,13 +381,12 @@ start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period
 # ============== HOME ===========================
 if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
-    if st.button("🔄 Refrescar datos"): refresh_data(); st.rerun()
+    if st.button("🔄 Refrescar datos"): refresh_all_caches(); st.rerun()
 
     pos_df = positions_from_tx(tx_df)
-    if pos_df.empty: st.info("No hay posiciones aún."); st.stop()
+    if pos_df.empty: st.info("No hay posiciones aún. Carga operaciones en 'Transactions'."); st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    # Descarga histórica SOLO con Yahoo
     prices, failed = fetch_prices_yf(tickers + [benchmark], start=start_date)
 
     bench_ret = pd.Series(dtype=float)
@@ -450,7 +467,7 @@ if page=="Mi Portafolio":
     st.download_button("⬇️ Descargar posiciones (CSV)", view.to_csv(index=False).encode("utf-8"),
                        file_name="mi_portafolio.csv", mime="text/csv")
 
-# ============== OPTIMIZAR (solo Yahoo) =========================
+# ============== OPTIMIZAR =========================
 elif page=="Optimizar y Rebalancear":
     st.title("🛠️ Optimizar y Rebalancear")
     pos_df = positions_from_tx(tx_df)
@@ -490,7 +507,7 @@ elif page=="Optimizar y Rebalancear":
     compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
     st.dataframe(compare.style.format({"Weight Actual":"{:.2%}","Weight Propuesto":"{:.2%}","Δ (pp)":"{:.2f}"}), use_container_width=True)
 
-# ============== EVALUAR CANDIDATO (solo Yahoo) ==================
+# ============== EVALUAR CANDIDATO ==================
 elif page=="Evaluar Candidato":
     st.title("🧪 Evaluar Candidato")
     pos_df = positions_from_tx(tx_df)
@@ -551,3 +568,38 @@ elif page=="Explorar / Research":
 elif page=="Herramientas":
     st.title("🧰 Herramientas")
     st.write("Próximamente: lotes detallados, ventas parciales y P/L realizado vs no realizado.")
+
+# ============== DIAGNÓSTICO =====================
+elif page=="Diagnóstico":
+    st.title("🩺 Diagnóstico")
+    col1,col2=st.columns(2)
+    with col1:
+        st.subheader("Secrets")
+        st.write({"SHEET_ID": bool(SHEET_ID), "gcp_service_account": bool(GCP_SA)})
+        st.caption("Si algo es False, revisa tus secrets.")
+
+        st.subheader("Sheets disponibles")
+        try:
+            sh = gc.open_by_key(SHEET_ID)
+            titles = [w.title for w in sh.worksheets()]
+            st.write(titles)
+        except Exception as e:
+            st.error(f"No pude listar hojas: {e}")
+
+        st.subheader("Settings")
+        st.dataframe(load_all_data()[1], use_container_width=True)
+
+    with col2:
+        st.subheader("Ping Yahoo (SPY 30 días)")
+        try:
+            test = yf.download("SPY", period="30d", interval="1d", auto_adjust=True, progress=False)
+            if test is None or test.empty:
+                st.warning("No recibí datos de Yahoo (SPY). Puede ser rate-limit o bloqueo de salida.")
+            else:
+                st.success(f"OK: {len(test)} barras.")
+                st.dataframe(test.tail(5))
+        except Exception as e:
+            st.error(f"Error al consultar Yahoo: {e}")
+
+    st.subheader("Transactions (muestra)")
+    st.dataframe(load_all_data()[0].head(10), use_container_width=True)
