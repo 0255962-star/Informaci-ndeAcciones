@@ -1,13 +1,13 @@
 # APP Finanzas – Portafolio Activo (Yahoo directo + yfinance fallback)
 # - Descarga de precios SOLO de Yahoo:
-#     1) Endpoint oficial JSON: https://query[1|2].finance.yahoo.com/v8/finance/chart/<ticker>
+#     1) Endpoint JSON directo: https://query[1|2].finance.yahoo.com/v8/finance/chart/<ticker>
 #     2) Fallback a yfinance con User-Agent, repair, raise_errors=False
-# - Robustez anti-403/HTML: headers, timeouts, backoff, 2 hosts.
+# - _direct_one SIEMPRE regresa (serie, error) para evitar unpack errors.
 # - Si ^GSPC falla, se omite sin romper la app (se informa en UI).
-# - Mantiene conexión a Google Sheets (Transactions/Settings/Watchlist).
+# - Conexión a Google Sheets (Transactions/Settings/Watchlist).
 
 from datetime import datetime, timedelta, timezone
-import os, time, math, json
+import os, time
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -57,7 +57,11 @@ except Exception as e:
 
 # ================== CACHES ==================
 def refresh_all():
-    for f in (read_sheet, load_all_data, fetch_prices_yahoo_direct, fetch_prices_yf, last_prices_direct, last_prices_yf):
+    for f in (
+        read_sheet, load_all_data,
+        fetch_prices_yahoo_direct, fetch_prices_yf,
+        last_prices_direct, last_prices_yf
+    ):
         try: f.clear()
         except Exception: pass
     try: st.cache_data.clear()
@@ -111,16 +115,12 @@ HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 def _range_from_dates(start: str|None, end: str|None):
     if start is None and end is None:
         return "max"
-    # Yahoo soporta rangos predefinidos; si viene start/end, mandamos ambos como unix.
-    return None
+    return None  # usando period1/period2 cuando hay fechas
 
 def _unix(dt):
     return int(pd.Timestamp(dt, tz=timezone.utc).timestamp())
 
 def _parse_chart_json(js) -> pd.Series:
-    """
-    Devuelve Serie de AdjClose si existe, de lo contrario Close.
-    """
     result = js.get("chart", {}).get("result", [])
     if not result: return pd.Series(dtype=float)
     r = result[0]
@@ -128,7 +128,7 @@ def _parse_chart_json(js) -> pd.Series:
     if not ts: return pd.Series(dtype=float)
     idx = pd.to_datetime(pd.Series(ts), unit="s", utc=True).dt.tz_convert(None)
 
-    adj = None
+    # adjclose si viene, si no close
     try:
         adj = r.get("indicators", {}).get("adjclose", [])
         if adj and "adjclose" in adj[0]:
@@ -136,8 +136,7 @@ def _parse_chart_json(js) -> pd.Series:
             s = pd.Series(vals, index=idx, dtype="float64").dropna()
             return s
     except Exception:
-        adj = None
-
+        pass
     try:
         quote = r.get("indicators", {}).get("quote", [])
         if quote and "close" in quote[0]:
@@ -149,6 +148,11 @@ def _parse_chart_json(js) -> pd.Series:
     return pd.Series(dtype=float)
 
 def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
+    """
+    Devuelve SIEMPRE (serie, error_str)
+      - serie: pd.Series con Close/AdjClose indexada por fecha
+      - error_str: None si OK, string con detalle si falló
+    """
     params = {
         "interval": interval,
         "includeAdjustedClose": "true",
@@ -172,28 +176,30 @@ def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
                     last_err = f"{url} -> HTTP {r.status_code}"
                     time.sleep(0.7*(k+1))
                     continue
-                # A veces Yahoo devuelve HTML/blank -> json() rompe; manejamos safe
                 try:
                     js = r.json()
                 except Exception as e:
                     last_err = f"{url} -> JSON error: {type(e).__name__}"
                     time.sleep(0.7*(k+1))
                     continue
+
                 s = _parse_chart_json(js)
-                if not s.empty and len(s.dropna()) >= 3:
+                if isinstance(s, pd.Series) and not s.empty and len(s.dropna()) >= 3:
                     s.name = ticker
-                    return s
+                    return s, None  # ÉXITO: SIEMPRE tupla
+
                 last_err = f"{url} -> respuesta vacía"
             except Exception as e:
                 last_err = f"{url} -> {type(e).__name__}: {e}"
+
             time.sleep(0.7*(k+1))
-    return pd.Series(dtype=float), last_err
+
+    # FALLÓ
+    return pd.Series(dtype=float), (last_err or "sin datos")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_prices_yahoo_direct(tickers, start=None, end=None, interval="1d"):
-    """
-    DESCARGA DIRECTA (primera prioridad). Devuelve (prices_df, fallidos, errores[])
-    """
+    """DESCARGA DIRECTA (primera prioridad). Devuelve (prices_df, fallidos, errores[])"""
     tickers = _clean_tickers(tickers)
     if not tickers: return pd.DataFrame(), [], []
 
@@ -213,9 +219,7 @@ def fetch_prices_yahoo_direct(tickers, start=None, end=None, interval="1d"):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def last_prices_direct(tickers):
-    """
-    Últimos precios via endpoint directo.
-    """
+    """Últimos precios via endpoint directo."""
     tickers = _clean_tickers(tickers)
     out, failed = {}, []
     for t in tickers:
@@ -227,10 +231,7 @@ def last_prices_direct(tickers):
     return out, failed
 
 # ================== YFINANCE (fallback) ==================
-os.environ.setdefault(
-    "YF_USER_AGENT",
-    UA
-)
+os.environ.setdefault("YF_USER_AGENT", UA)
 
 def _flatten_close(df_like):
     if df_like is None or len(df_like)==0:
@@ -255,7 +256,6 @@ def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
     if not tickers: return pd.DataFrame(), [], errs
 
     frames=[]; got=set()
-    # Lote
     try:
         if start is None and end is None:
             batch = yf.download(
@@ -277,7 +277,6 @@ def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
     except Exception as e:
         errs.append(f"[yf-batch] {type(e).__name__}: {e}")
 
-    # por-ticker
     missing=[t for t in tickers if t not in got]
     for t in missing:
         df_t=pd.DataFrame()
@@ -557,7 +556,6 @@ elif page=="Optimizar y Rebalancear":
     if pos_df.empty: st.info("No hay posiciones."); st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    # Directo + fallback
     prices, failed_d, errs_d = fetch_prices_yahoo_direct(tickers, start=start_date)
     if prices.empty:
         prices, failed_yf, errs_yf = fetch_prices_yf(tickers, start=start_date)
