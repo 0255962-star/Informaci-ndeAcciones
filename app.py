@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio Activo (Yahoo directo + yfinance fallback compatible)
+# APP Finanzas – Portafolio Activo (Yahoo sólo con yfinance secuencial + directo como backup)
 from datetime import datetime, timedelta, timezone
 import os, time
 import numpy as np
@@ -18,12 +18,8 @@ st.set_page_config(page_title="APP Finanzas – Portafolio Activo", page_icon="�
 st.markdown("""
 <style>
 :root {
-  --bg: #0b0f1a;
-  --card: #141927;
-  --muted: #8b93a7;
-  --brand: #7c6cff;
-  --up: #18b26b;
-  --down: #ff4d4f;
+  --bg: #0b0f1a; --card: #141927; --muted: #8b93a7;
+  --brand: #7c6cff; --up: #18b26b; --down: #ff4d4f;
 }
 .block-container { padding-top: 0.8rem; }
 section[data-testid="stSidebar"] { border-right: 1px solid #1e2435; }
@@ -100,9 +96,10 @@ def _clean_tickers(tickers):
         if t2 and t2 not in uniq: uniq.append(t2)
     return uniq
 
-# ================== YAHOO JSON DIRECTO ==================
+# ================== YAHOO JSON DIRECTO (backup) ==================
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
+os.environ.setdefault("YF_USER_AGENT", UA)
 
 def _range_from_dates(start: str|None, end: str|None):
     if start is None and end is None:
@@ -123,22 +120,19 @@ def _parse_chart_json(js) -> pd.Series:
         adj = r.get("indicators", {}).get("adjclose", [])
         if adj and "adjclose" in adj[0]:
             vals = adj[0]["adjclose"]
-            s = pd.Series(vals, index=idx, dtype="float64").dropna()
-            return s
+            return pd.Series(vals, index=idx, dtype="float64").dropna()
     except Exception:
         pass
     try:
         quote = r.get("indicators", {}).get("quote", [])
         if quote and "close" in quote[0]:
             vals = quote[0]["close"]
-            s = pd.Series(vals, index=idx, dtype="float64").dropna()
-            return s
+            return pd.Series(vals, index=idx, dtype="float64").dropna()
     except Exception:
         pass
     return pd.Series(dtype=float)
 
 def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
-    """SIEMPRE devuelve (serie, error_str)"""
     params = {"interval": interval, "includeAdjustedClose": "true"}
     rng = _range_from_dates(start, end)
     if rng: params["range"]=rng
@@ -198,102 +192,67 @@ def last_prices_direct(tickers):
             failed.append(t)
     return out, failed
 
-# ================== YFINANCE (FALLBACK COMPATIBLE) ==================
-os.environ.setdefault("YF_USER_AGENT", UA)
-
-def _flatten_close(df_like):
-    if df_like is None or len(df_like)==0:
-        return pd.DataFrame()
-    df = df_like.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            close = df['Close'].copy()
-        except Exception:
-            return pd.DataFrame()
-        close = close.loc[:, close.notna().any()]
-        return close
-    if 'Close' in df.columns:
-        return df[['Close']].rename(columns={'Close':'_TMP_'}).copy()
-    return pd.DataFrame()
-
-@st.cache_data(ttl=900, show_spinner=False)
+# ================== yfinance SECUENCIAL (principal) ==================
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
-                     max_retries=2, pause_sec=0.9, min_rows=3):
-    """Versión compatible: SIN raise_errors / repair / timeout."""
-    errs=[]
-    tickers=_clean_tickers(tickers)
-    if not tickers: return pd.DataFrame(), [], errs
+                     pause_sec=1.2, retries=3, years=10):
+    """
+    Descarga secuencial para esquivar rate-limit de Yahoo.
+    Sin argumentos nuevos (compatible con versiones antiguas).
+    """
+    tickers = _clean_tickers(tickers)
+    if not tickers:
+        return pd.DataFrame(), [], []
 
-    frames=[]; got=set()
-    try:
-        if start is None and end is None:
-            batch = yf.download(
-                tickers=tickers, period="max", interval=interval,
-                auto_adjust=True, progress=False, group_by="ticker",
-                threads=False
-            )
-        else:
-            batch = yf.download(
-                tickers=tickers, start=start, end=end, interval=interval,
-                auto_adjust=True, progress=False, group_by="ticker",
-                threads=False
-            )
-        flat=_flatten_close(batch)
-        if not flat.empty:
-            if list(flat.columns)==['_TMP_'] and len(tickers)==1:
-                flat.columns=[tickers[0]]
-            frames.append(flat); got=set(flat.columns)
-    except Exception as e:
-        errs.append(f"[yf-batch] {type(e).__name__}: {e}")
-
-    missing=[t for t in tickers if t not in got]
-    for t in missing:
-        df_t=pd.DataFrame()
-        for k in range(max_retries+1):
+    frames, failed, errs = [], [], []
+    for t in tickers:
+        got = pd.DataFrame()
+        for k in range(retries):
             try:
-                d = yf.download(
-                    t,
-                    period="max" if (start is None and end is None) else None,
-                    start=start, end=end, interval=interval,
-                    auto_adjust=True, progress=False, threads=False
-                )
-                c=_flatten_close(d)
-                if not c.empty:
-                    if list(c.columns)==['_TMP_']: c.columns=[t]
-                    if c.shape[0] >= min_rows:
-                        df_t = c[[t]] if t in c.columns else c
+                if start is None and end is None:
+                    d = yf.download(t, period=f"{years}y", interval=interval,
+                                    auto_adjust=True, progress=False, threads=False)
+                else:
+                    d = yf.download(t, start=start, end=end, interval=interval,
+                                    auto_adjust=True, progress=False, threads=False)
+                if d is not None and not d.empty and "Close" in d.columns:
+                    s = d["Close"].dropna()
+                    if not s.empty:
+                        frames.append(s.rename(t).to_frame())
+                        got = frames[-1]
                         break
             except Exception as e:
-                if k==max_retries: errs.append(f"[yf-dl:{t}] {type(e).__name__}: {e}")
-            time.sleep(pause_sec*(k+1))
-        if not df_t.empty:
-            frames.append(df_t)
+                if k == retries - 1:
+                    errs.append(f"[yf:{t}] {type(e).__name__}: {e}")
+            time.sleep(pause_sec * (k + 1))
+        if got.empty:
+            failed.append(t)
 
     if frames:
-        prices=pd.concat(frames,axis=1).sort_index()
-        prices=prices.loc[:, prices.notna().any()]
-        failed=[t for t in tickers if t not in prices.columns]
-        return prices, failed, errs
+        df = pd.concat(frames, axis=1).sort_index()
+        return df, failed, errs
     return pd.DataFrame(), tickers, errs
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def last_prices_yf(tickers):
-    tickers=_clean_tickers(tickers)
-    ok, failed={}, []
+    tickers = _clean_tickers(tickers)
+    out, failed = {}, []
     for t in tickers:
-        try:
-            d=yf.download(t, period="15d", interval="1d", auto_adjust=True,
-                          progress=False, threads=False)
-            c=_flatten_close(d)
-            if not c.empty:
-                if list(c.columns)==['_TMP_']: c.columns=[t]
-                s=c.iloc[:,0].dropna().ffill()
-                if not s.empty:
-                    ok[t]=float(s.iloc[-1]); continue
-        except Exception:
-            pass
-        failed.append(t)
-    return ok, failed
+        ok = False
+        for k in range(3):
+            try:
+                d = yf.download(t, period="15d", interval="1d",
+                                auto_adjust=True, progress=False, threads=False)
+                if d is not None and not d.empty and "Close" in d.columns:
+                    s = d["Close"].dropna().ffill()
+                    if not s.empty:
+                        out[t] = float(s.iloc[-1]); ok = True; break
+            except Exception:
+                pass
+            time.sleep(1.2 * (k + 1))
+        if not ok:
+            failed.append(t)
+    return out, failed
 
 # ================== MÉTRICAS ==================
 def annualize_return(d, freq=252):
@@ -350,10 +309,11 @@ def positions_from_tx(tx:pd.DataFrame):
     if not uniq:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
 
-    last_map, failed_lp = last_prices_direct(uniq)
+    # primero yfinance (último precio)
+    last_map, failed_lp = last_prices_yf(uniq)
     if failed_lp:
-        last_map_yf, failed_lp2 = last_prices_yf(failed_lp)
-        last_map.update(last_map_yf)
+        last_map2, failed_lp2 = last_prices_direct(failed_lp)  # backup directo
+        last_map.update(last_map2)
         failed_lp = failed_lp2
 
     pos=[]
@@ -414,7 +374,7 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","^GSPC",str)
+benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # usa SPY por defecto (más robusto)
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
 
@@ -425,6 +385,44 @@ window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"],
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
+# ================== FUNCIÓN CARGA PRECIOS ROBUSTA ==================
+def load_prices_with_fallback(tickers, bench, start_date):
+    # 1) yfinance secuencial (principal)
+    prices, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
+
+    bench_ret = pd.Series(dtype=float)
+    if not prices.empty and bench in prices.columns:
+        bench_ret = prices[[bench]].pct_change().dropna()[bench]
+        prices = prices.drop(columns=[bench], errors="ignore")
+
+    # 2) si vacío, intento directo
+    if prices.empty:
+        prices2, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [bench], start=start_date)
+        if not prices2.empty and bench in prices2.columns:
+            bench_ret = prices2[[bench]].pct_change().dropna()[bench]
+            prices2 = prices2.drop(columns=[bench], errors="ignore")
+        prices = prices2
+        failed_all = failed_d
+        errs_all = errs_yf + errs_d
+    else:
+        failed_all = failed_yf
+        errs_all = errs_yf
+
+    # 3) benchmark alterno si aún vacío
+    if prices.empty:
+        alt_bench = "SPY"
+        if bench != alt_bench and alt_bench not in tickers:
+            tmp, fb, fe = fetch_prices_yf(tickers + [alt_bench], start=start_date)
+            if not tmp.empty:
+                if alt_bench in tmp.columns:
+                    bench_ret = tmp[[alt_bench]].pct_change().dropna()[alt_bench]
+                    tmp = tmp.drop(columns=[alt_bench], errors="ignore")
+                prices = tmp
+                failed_all = list(set((failed_all or []) + fb))
+                errs_all = (errs_all or []) + fe
+
+    return prices, bench_ret, (failed_all or []), (errs_all or [])
+
 # ================== MI PORTAFOLIO ==================
 if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
@@ -434,21 +432,7 @@ if page=="Mi Portafolio":
     if pos_df.empty: st.info("No hay posiciones. Carga operaciones en 'Transactions'."); st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    # 1) DIRECTO
-    prices, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [benchmark], start=start_date)
-    bench_ret = pd.Series(dtype=float)
-    if not prices.empty and benchmark in prices.columns:
-        bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
-        prices = prices.drop(columns=[benchmark], errors="ignore")
-    # 2) FALLBACK YF
-    if prices.empty or len(prices.columns)==0:
-        prices2, failed_yf, errs_yf = fetch_prices_yf(tickers + [benchmark], start=start_date)
-        if not prices2.empty and benchmark in prices2.columns:
-            bench_ret = prices2[[benchmark]].pct_change().dropna()[benchmark]
-            prices2 = prices2.drop(columns=[benchmark], errors="ignore")
-        prices, failed_all, errs_all = prices2, failed_yf, errs_yf
-    else:
-        failed_all, errs_all = failed_d, errs_d
+    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
 
     if prices.empty or len(prices.columns)==0:
         st.warning("No se pudieron obtener precios históricos desde Yahoo.")
@@ -523,23 +507,18 @@ elif page=="Optimizar y Rebalancear":
     if pos_df.empty: st.info("No hay posiciones."); st.stop()
 
     tickers = pos_df["Ticker"].tolist()
-    prices, failed_d, errs_d = fetch_prices_yahoo_direct(tickers, start=start_date)
-    if prices.empty:
-        prices, failed_yf, errs_yf = fetch_prices_yf(tickers, start=start_date)
-        failed, errs = failed_yf, errs_yf
-    else:
-        failed, errs = failed_d, errs_d
+    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
 
     if prices.empty:
         st.warning("No hay precios para optimizar (Yahoo).")
-        if failed: st.caption("Fallidos: " + ", ".join(sorted(set(failed))))
-        if errs:
+        if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
+        if errs_all:
             with st.expander("Detalles de errores Yahoo"): 
-                for e in errs: st.code(e)
+                for e in errs_all: st.code(e)
         st.stop()
 
-    if failed:
-        st.caption("⚠️ Excluidos por falta de histórico: " + ", ".join(sorted(set(failed))))
+    if failed_all:
+        st.caption("⚠️ Excluidos por falta de histórico: " + ", ".join(sorted(set(failed_all))))
         good = [c for c in prices.columns if prices[c].notna().any()]
         prices = prices[good]
         pos_df = pos_df[pos_df["Ticker"].isin(good)].copy()
@@ -576,26 +555,21 @@ elif page=="Evaluar Candidato":
 
     tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
     if not tkr: st.stop()
-    tickers = pos_df["Ticker"].tolist()
-    prices, failed_d, errs_d = fetch_prices_yahoo_direct(sorted(set(tickers+[tkr])), start=start_date)
-    if prices.empty:
-        prices, failed_yf, errs_yf = fetch_prices_yf(sorted(set(tickers+[tkr])), start=start_date)
-        failed, errs = failed_yf, errs_yf
-    else:
-        failed, errs = failed_d, errs_d
+    tickers = sorted(set(pos_df["Ticker"].tolist()+[tkr]))
+    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
 
     if prices.empty:
         st.warning("No se pudieron descargar precios desde Yahoo.")
-        if failed: st.caption("Fallidos: " + ", ".join(sorted(set(failed))))
-        if errs:
+        if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
+        if errs_all:
             with st.expander("Detalles de errores Yahoo"):
-                for e in errs: st.code(e)
+                for e in errs_all: st.code(e)
         st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    last_map, fail_lp = last_prices_direct([tkr])
+    last_map, fail_lp = last_prices_yf([tkr])  # usa yfinance primero para último precio
     if fail_lp:
-        last_map2, _ = last_prices_yf(fail_lp)
+        last_map2, _ = last_prices_direct(fail_lp)
         last_map.update(last_map2)
     last = last_map.get(tkr, np.nan)
     if np.isnan(last): st.warning("Ticker inválido o sin último precio (Yahoo)."); st.stop()
@@ -627,29 +601,22 @@ elif page=="Explorar / Research":
     st.title("🔎 Explorar / Research")
     tkr=st.text_input("Ticker", value="MSFT").upper().strip().replace(" ","")
     if tkr:
-        hist, failed_d, errs_d = fetch_prices_yahoo_direct([tkr], start=start_date)
-        if hist.empty:
-            hist, failed_yf, errs_yf = fetch_prices_yf([tkr], start=start_date)
-            failed, errs = failed_yf, errs_yf
-        else:
-            failed, errs = failed_d, errs_d
-
+        hist, bench_ret, failed_all, errs_all = load_prices_with_fallback([tkr], benchmark, start_date)
         if not hist.empty and tkr in hist.columns:
             ser = hist[tkr].dropna()
             if not ser.empty:
                 df = pd.DataFrame({"Close": ser})
                 fig=go.Figure(data=[go.Candlestick(
-                    x=df.index,
-                    open=df["Close"], high=df["Close"], low=df["Close"], close=df["Close"]
+                    x=df.index, open=df["Close"], high=df["Close"], low=df["Close"], close=df["Close"]
                 )])
                 fig.update_layout(title=f"Serie (Close) {tkr}", xaxis_rangeslider_visible=False, height=480)
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning("Yahoo no entregó histórico para ese ticker.")
-            if failed: st.caption("Fallidos: " + ", ".join(failed))
-            if errs:
+            if failed_all: st.caption("Fallidos: " + ", ".join(failed_all))
+            if errs_all:
                 with st.expander("Detalles de errores Yahoo"):
-                    for e in errs: st.code(e)
+                    for e in errs_all: st.code(e)
 
 elif page=="Diagnóstico":
     st.title("🩺 Diagnóstico rápido")
@@ -668,18 +635,6 @@ elif page=="Diagnóstico":
         st.dataframe(load_all_data()[1], use_container_width=True)
 
     with col2:
-        st.subheader("Ping Yahoo directo (MSFT 30d)")
-        try:
-            s, err = _direct_one("MSFT", interval="1d")
-            if isinstance(s, pd.Series) and not s.empty:
-                st.success(f"OK directo: {len(s.tail(30))} puntos")
-                st.dataframe(s.tail(5).to_frame("Close"))
-            else:
-                st.warning("Directo vacío.")
-                if err: st.code(err)
-        except Exception as e:
-            st.error(f"Error directo: {e}")
-
         st.subheader("Ping yfinance (SPY 30d)")
         try:
             test = yf.download("SPY", period="30d", interval="1d", auto_adjust=True,
@@ -691,6 +646,18 @@ elif page=="Diagnóstico":
                 st.dataframe(test.tail(5))
         except Exception as e:
             st.error(f"Error yfinance: {e}")
+
+        st.subheader("Ping Yahoo directo (MSFT 30d)")
+        try:
+            s, err = _direct_one("MSFT", interval="1d")
+            if isinstance(s, pd.Series) and not s.empty:
+                st.success(f"OK directo: {len(s.tail(30))} puntos")
+                st.dataframe(s.tail(5).to_frame("Close"))
+            else:
+                st.warning("Directo vacío.")
+                if err: st.code(err)
+        except Exception as e:
+            st.error(f"Error directo: {e}")
 
     st.subheader("Transactions (muestra)")
     st.dataframe(load_all_data()[0].head(10), use_container_width=True)
