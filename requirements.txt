@@ -3,7 +3,9 @@ pandas==2.2.2
 numpy==1.26.4
 scipy==1.11.4
 plotly==5.22.0
-yfinance==0.2.43
+
+yfinance==0.2.50
+requests==2.32.3
 
 gspread==6.1.2
 google-auth==2.33.0
