@@ -101,11 +101,6 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 os.environ.setdefault("YF_USER_AGENT", UA)
 
-def _range_from_dates(start: str|None, end: str|None):
-    if start is None and end is None:
-        return "max"
-    return None
-
 def _unix(dt):
     return int(pd.Timestamp(dt, tz=timezone.utc).timestamp())
 
@@ -132,23 +127,16 @@ def _parse_chart_json(js) -> pd.Series:
         pass
     return pd.Series(dtype=float)
 
-# --- FIX PRINCIPAL: siempre enviar period2 cuando hay start (evita HTTP 400) ---
 def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
     params = {"interval": interval, "includeAdjustedClose": "true",
               "events": "div,splits", "lang": "en-US", "region": "US"}
-
     if start is None and end is None:
         params["range"] = "max"
     else:
         p1 = _unix(start) if start else None
-        if end:
-            p2 = _unix(end)
-        else:
-            p2 = int(pd.Timestamp.utcnow().timestamp())
-        if p1:
-            params["period1"] = p1
+        p2 = _unix(end) if end else int(pd.Timestamp.utcnow().timestamp())
+        if p1: params["period1"] = p1
         params["period2"] = p2  # <- obligatorio si hay period1
-
     headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
     last_err = None
     for host in HOSTS:
@@ -157,17 +145,14 @@ def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
             try:
                 r = requests.get(url, headers=headers, params=params, timeout=timeout)
                 if r.status_code != 200:
-                    last_err = f"{url} -> HTTP {r.status_code}"
-                    time.sleep(0.7*(k+1)); continue
+                    last_err = f"{url} -> HTTP {r.status_code}"; time.sleep(0.7*(k+1)); continue
                 try:
                     js = r.json()
                 except Exception as e:
-                    last_err = f"{url} -> JSON error: {type(e).__name__}"
-                    time.sleep(0.7*(k+1)); continue
+                    last_err = f"{url} -> JSON error: {type(e).__name__}"; time.sleep(0.7*(k+1)); continue
                 s = _parse_chart_json(js)
                 if isinstance(s, pd.Series) and not s.empty and len(s.dropna()) >= 3:
-                    s.name = ticker
-                    return s, None
+                    s.name = ticker; return s, None
                 last_err = f"{url} -> respuesta vacía"
             except Exception as e:
                 last_err = f"{url} -> {type(e).__name__}: {e}"
@@ -207,14 +192,9 @@ def last_prices_direct(tickers):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
                      pause_sec=1.2, retries=3, years=10):
-    """
-    Descarga secuencial para esquivar rate-limit de Yahoo.
-    Sin argumentos nuevos (compatible con versiones antiguas).
-    """
     tickers = _clean_tickers(tickers)
     if not tickers:
         return pd.DataFrame(), [], []
-
     frames, failed, errs = [], [], []
     for t in tickers:
         got = pd.DataFrame()
@@ -238,7 +218,6 @@ def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
             time.sleep(pause_sec * (k + 1))
         if got.empty:
             failed.append(t)
-
     if frames:
         df = pd.concat(frames, axis=1).sort_index()
         return df, failed, errs
@@ -320,10 +299,9 @@ def positions_from_tx(tx:pd.DataFrame):
     if not uniq:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
 
-    # primero yfinance (último precio)
     last_map, failed_lp = last_prices_yf(uniq)
     if failed_lp:
-        last_map2, failed_lp2 = last_prices_direct(failed_lp)  # backup directo
+        last_map2, failed_lp2 = last_prices_direct(failed_lp)
         last_map.update(last_map2)
         failed_lp = failed_lp2
 
@@ -386,7 +364,7 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # usa SPY por defecto (más robusto)
+benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # SPY por defecto
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
 
@@ -399,15 +377,11 @@ start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period
 
 # ================== FUNCIÓN CARGA PRECIOS ROBUSTA ==================
 def load_prices_with_fallback(tickers, bench, start_date):
-    # 1) yfinance secuencial (principal)
     prices, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
-
     bench_ret = pd.Series(dtype=float)
     if not prices.empty and bench in prices.columns:
         bench_ret = prices[[bench]].pct_change().dropna()[bench]
         prices = prices.drop(columns=[bench], errors="ignore")
-
-    # 2) si vacío, intento directo (con period2 corregido)
     if prices.empty:
         prices2, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [bench], start=start_date, end=None)
         if not prices2.empty and bench in prices2.columns:
@@ -419,8 +393,6 @@ def load_prices_with_fallback(tickers, bench, start_date):
     else:
         failed_all = failed_yf
         errs_all = errs_yf
-
-    # 3) benchmark alterno si aún vacío
     if prices.empty:
         alt_bench = "SPY"
         if bench != alt_bench and alt_bench not in tickers:
@@ -432,7 +404,6 @@ def load_prices_with_fallback(tickers, bench, start_date):
                 prices = tmp
                 failed_all = list(set((failed_all or []) + fb))
                 errs_all = (errs_all or []) + fe
-
     return prices, bench_ret, (failed_all or []), (errs_all or [])
 
 # ================== MI PORTAFOLIO ==================
@@ -471,16 +442,17 @@ if page=="Mi Portafolio":
         "Δ % ventana": (window_change.reindex(pos_df["Ticker"]).values*100.0),
         "Peso %": (w.reindex(pos_df["Ticker"]).values*100.0),
         "Valor": pos_df["MarketValue"].values
-    })
+    }).replace([np.inf,-np.inf], np.nan)
 
-    fmt_money = {"Avg Buy":"$,.2f","Last":"$,.2f","P/L $":"$,.2f","Valor":"$,.2f"}
-    fmt_pct = {"P/L % (compra)":"{:.2f}%","Δ % ventana":"{:.2f}%","Peso %":"{:.2f}%"}
+    # --- Formato corregido (dinero con ${:,.2f}) y NA como "—" ---
+    money_fmt = {"Avg Buy":"${:,.2f}","Last":"${:,.2f}","P/L $":"${:,.2f}","Valor":"${:,.2f}"}
+    pct_fmt   = {"P/L % (compra)":"{:,.2f}%","Δ % ventana":"{:,.2f}%","Peso %":"{:,.2f}%"}
     def color_pct(val):
         if pd.isna(val): return "color: inherit;"
         return "color: #18b26b;" if val>=0 else "color: #ff4d4f;"
 
     styled = (view.style
-        .format({**fmt_money, **fmt_pct})
+        .format({**money_fmt, **pct_fmt}, na_rep="—")
         .applymap(color_pct, subset=["P/L % (compra)","Δ % ventana"])
         .set_properties(subset=["#","Ticker","Shares"], **{"font-weight":"600"})
     )
@@ -534,19 +506,21 @@ elif page=="Optimizar y Rebalancear":
         good = [c for c in prices.columns if prices[c].notna().any()]
         prices = prices[good]
         pos_df = pos_df[pos_df["Ticker"].isin(good)].copy()
-        tickers = good
 
     w_cur = weights_from_positions(pos_df)
     port_ret_cur, asset_rets = const_weight_returns(prices, w_cur)
     if asset_rets.empty:
         st.warning("No hay retornos suficientes para optimizar."); st.stop()
 
-    mean_daily=asset_rets.mean(); cov=asset_rets.cov(); mu_ann=(1+mean_daily)**252-1
-    w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
-    w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
-    bounds=[(w_min,w_max)]*len(tickers)
-    w_opt = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
-    w_opt = pd.Series(w_opt, index=tickers).clip(lower=w_min, upper=w_max); w_opt/=w_opt.sum()
+    mean_daily=asset_rets.mean()
+    cov=asset_rets.cov()
+    mu_ann=(1+mean_daily)**252-1
+    # --- bounds del tamaño correcto (evita ValueError de SciPy) ---
+    n=len(mu_ann)
+    bounds=[(w_min,w_max)]*n
+    w_opt_arr = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
+    w_opt = pd.Series(w_opt_arr, index=mu_ann.index).clip(lower=w_min, upper=w_max)
+    w_opt /= w_opt.sum()
 
     port_ret_opt,_ = const_weight_returns(prices, w_opt)
     c1,c2,c3,c4=st.columns(4)
@@ -557,7 +531,7 @@ elif page=="Optimizar y Rebalancear":
 
     compare=pd.DataFrame({"Weight Actual":w_cur,"Weight Propuesto":w_opt}).fillna(0)
     compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
-    st.dataframe(compare.style.format({"Weight Actual":"{:.2%}","Weight Propuesto":"{:.2%}","Δ (pp)":"{:.2f}"}), use_container_width=True)
+    st.dataframe(compare.style.format({"Weight Actual":"{:,.2%}","Weight Propuesto":"{:,.2%}","Δ (pp)":"{:,.2f}"}), use_container_width=True)
 
 # ================== EVALUAR CANDIDATO ==================
 elif page=="Evaluar Candidato":
@@ -579,7 +553,7 @@ elif page=="Evaluar Candidato":
         st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    last_map, fail_lp = last_prices_yf([tkr])  # usa yfinance primero para último precio
+    last_map, fail_lp = last_prices_yf([tkr])
     if fail_lp:
         last_map2, _ = last_prices_direct(fail_lp)
         last_map.update(last_map2)
@@ -673,3 +647,4 @@ elif page=="Diagnóstico":
 
     st.subheader("Transactions (muestra)")
     st.dataframe(load_all_data()[0].head(10), use_container_width=True)
+
