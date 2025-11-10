@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio Activo (Yahoo sólo con yfinance secuencial + directo como backup)
+# APP Finanzas – Portafolio Activo (Yahoo con yfinance + fallback directo corregido)
 from datetime import datetime, timedelta, timezone
 import os, time
 import numpy as np
@@ -132,12 +132,23 @@ def _parse_chart_json(js) -> pd.Series:
         pass
     return pd.Series(dtype=float)
 
+# --- FIX PRINCIPAL: siempre enviar period2 cuando hay start (evita HTTP 400) ---
 def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
-    params = {"interval": interval, "includeAdjustedClose": "true"}
-    rng = _range_from_dates(start, end)
-    if rng: params["range"]=rng
-    if start: params["period1"]=_unix(start)
-    if end: params["period2"]=_unix(end)
+    params = {"interval": interval, "includeAdjustedClose": "true",
+              "events": "div,splits", "lang": "en-US", "region": "US"}
+
+    if start is None and end is None:
+        params["range"] = "max"
+    else:
+        p1 = _unix(start) if start else None
+        if end:
+            p2 = _unix(end)
+        else:
+            p2 = int(pd.Timestamp.utcnow().timestamp())
+        if p1:
+            params["period1"] = p1
+        params["period2"] = p2  # <- obligatorio si hay period1
+
     headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
     last_err = None
     for host in HOSTS:
@@ -334,6 +345,7 @@ def positions_from_tx(tx:pd.DataFrame):
         inv= sh*avg if not np.isnan(avg) else np.nan
         pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
         pos.append([t,sh,avg,inv,px,mv,pl])
+    
     dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
     if failed_lp: st.caption("⚠️ Sin último precio: " + ", ".join(failed_lp))
     return dfp.sort_values("MarketValue",ascending=False)
@@ -395,9 +407,9 @@ def load_prices_with_fallback(tickers, bench, start_date):
         bench_ret = prices[[bench]].pct_change().dropna()[bench]
         prices = prices.drop(columns=[bench], errors="ignore")
 
-    # 2) si vacío, intento directo
+    # 2) si vacío, intento directo (con period2 corregido)
     if prices.empty:
-        prices2, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [bench], start=start_date)
+        prices2, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [bench], start=start_date, end=None)
         if not prices2.empty and bench in prices2.columns:
             bench_ret = prices2[[bench]].pct_change().dropna()[bench]
             prices2 = prices2.drop(columns=[bench], errors="ignore")
