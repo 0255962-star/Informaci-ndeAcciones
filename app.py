@@ -1,650 +1,526 @@
-# APP Finanzas – Portafolio Activo (Yahoo con yfinance + fallback directo corregido)
-from datetime import datetime, timedelta, timezone
-import os, time
+import os
+import io
+from datetime import datetime, timedelta
+from functools import lru_cache
+
 import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
-import requests
 import yfinance as yf
-from scipy.optimize import minimize
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ================== CONFIG GENERAL ==================
-st.set_page_config(page_title="APP Finanzas – Portafolio Activo", page_icon="💼", layout="wide")
-st.markdown("""
-<style>
-:root {
-  --bg: #0b0f1a; --card: #141927; --muted: #8b93a7;
-  --brand: #7c6cff; --up: #18b26b; --down: #ff4d4f;
-}
-.block-container { padding-top: 0.8rem; }
-section[data-testid="stSidebar"] { border-right: 1px solid #1e2435; }
-div[data-testid="stMetricValue"]{font-size:1.6rem}
-[data-testid="stHeader"] { background: rgba(0,0,0,0); }
-</style>
-""", unsafe_allow_html=True)
+# -------------------------------
+# Config general
+# -------------------------------
+st.set_page_config(page_title="APP Finanzas – Portafolio", layout="wide")
 
-# ================== SECRETS / SHEETS ==================
-SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
-GCP_SA = st.secrets.get("gcp_service_account", {})
-if not SHEET_ID:
-    st.error("Falta `SHEET_ID` en secrets."); st.stop()
-if not GCP_SA:
-    st.error("Falta el bloque `gcp_service_account` en secrets."); st.stop()
+# Helpers
+def _to_date(x):
+    if pd.isna(x):
+        return None
+    if isinstance(x, (pd.Timestamp, datetime)):
+        return pd.to_datetime(x).date()
+    return pd.to_datetime(str(x)).date()
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-try:
-    credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
-    gc = gspread.authorize(credentials)
-except Exception as e:
-    st.error(f"No se pudo autorizar Google Sheets: {e}"); st.stop()
-
-# ================== CACHES ==================
-def refresh_all():
-    for f in (
-        read_sheet, load_all_data,
-        fetch_prices_yahoo_direct, fetch_prices_yf,
-        last_prices_direct, last_prices_yf
-    ):
-        try: f.clear()
-        except Exception: pass
-    try: st.cache_data.clear()
-    except Exception: pass
-
-@st.cache_data(ttl=600, show_spinner=False)
-def read_sheet(name:str)->pd.DataFrame:
-    sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
-    return pd.DataFrame(ws.get_all_records())
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_all_data():
-    def safe(name, cols):
-        try:
-            df = read_sheet(name)
-            if df.empty: return pd.DataFrame(columns=cols)
-            for c in cols:
-                if c not in df.columns: df[c]=np.nan
-            return df
-        except Exception:
-            return pd.DataFrame(columns=cols)
-
-    tx_cols = ["TradeID","Account","Ticker","Name","AssetType","Currency",
-               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
-               "GrossAmount","NetAmount","LotID","Source","Notes"]
-    tx = safe("Transactions", tx_cols)
-    settings = safe("Settings", ["Key","Value","Description"])
-    watchlist = safe("Watchlist", ["Ticker","TargetWeight","Notes"])
-    return tx, settings, watchlist
-
-def get_setting(settings_df, key, default=None, cast=float):
+def format_money(x):
     try:
-        s = settings_df.loc[settings_df["Key"]==key,"Value"]
-        if s.empty: return default
-        return cast(s.values[0]) if cast else s.values[0]
+        return f"${x:,.2f}"
     except Exception:
-        return default
+        return x
 
-def _clean_tickers(tickers):
-    uniq=[]
-    for t in tickers:
-        if not isinstance(t,str): continue
-        t2=t.upper().strip().replace(" ","")
-        if t2 and t2 not in uniq: uniq.append(t2)
-    return uniq
+# -------------------------------
+# Conexión a Google Sheets
+# -------------------------------
+@st.cache_resource(show_spinner=False)
+def get_gs_client():
+    sa_info = st.secrets["gcp_service_account"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+    return gspread.authorize(creds)
 
-# ================== YAHOO JSON DIRECTO (backup) ==================
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
-os.environ.setdefault("YF_USER_AGENT", UA)
-
-def _unix(dt):
-    return int(pd.Timestamp(dt, tz=timezone.utc).timestamp())
-
-def _parse_chart_json(js) -> pd.Series:
-    result = js.get("chart", {}).get("result", [])
-    if not result: return pd.Series(dtype=float)
-    r = result[0]
-    ts = r.get("timestamp", [])
-    if not ts: return pd.Series(dtype=float)
-    idx = pd.to_datetime(pd.Series(ts), unit="s", utc=True).dt.tz_convert(None)
-    try:
-        adj = r.get("indicators", {}).get("adjclose", [])
-        if adj and "adjclose" in adj[0]:
-            vals = adj[0]["adjclose"]
-            return pd.Series(vals, index=idx, dtype="float64").dropna()
-    except Exception:
-        pass
-    try:
-        quote = r.get("indicators", {}).get("quote", [])
-        if quote and "close" in quote[0]:
-            vals = quote[0]["close"]
-            return pd.Series(vals, index=idx, dtype="float64").dropna()
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
-
-def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
-    params = {"interval": interval, "includeAdjustedClose": "true",
-              "events": "div,splits", "lang": "en-US", "region": "US"}
-    if start is None and end is None:
-        params["range"] = "max"
+@st.cache_resource(show_spinner=False)
+def open_spreadsheet():
+    gc = get_gs_client()
+    # Puedes usar SHEET_ID o GSHEETS_SPREADSHEET_NAME
+    key = st.secrets.get("SHEET_ID", None)
+    if key:
+        sh = gc.open_by_key(key)
     else:
-        p1 = _unix(start) if start else None
-        p2 = _unix(end) if end else int(pd.Timestamp.utcnow().timestamp())
-        if p1: params["period1"] = p1
-        params["period2"] = p2  # <- obligatorio si hay period1
-    headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
-    last_err = None
-    for host in HOSTS:
-        url = f"{host}/v8/finance/chart/{ticker}"
-        for k in range(3):
-            try:
-                r = requests.get(url, headers=headers, params=params, timeout=timeout)
-                if r.status_code != 200:
-                    last_err = f"{url} -> HTTP {r.status_code}"; time.sleep(0.7*(k+1)); continue
-                try:
-                    js = r.json()
-                except Exception as e:
-                    last_err = f"{url} -> JSON error: {type(e).__name__}"; time.sleep(0.7*(k+1)); continue
-                s = _parse_chart_json(js)
-                if isinstance(s, pd.Series) and not s.empty and len(s.dropna()) >= 3:
-                    s.name = ticker; return s, None
-                last_err = f"{url} -> respuesta vacía"
-            except Exception as e:
-                last_err = f"{url} -> {type(e).__name__}: {e}"
-            time.sleep(0.7*(k+1))
-    return pd.Series(dtype=float), (last_err or "sin datos")
+        sh = gc.open(st.secrets["GSHEETS_SPREADSHEET_NAME"])
+    return sh
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_prices_yahoo_direct(tickers, start=None, end=None, interval="1d"):
-    tickers = _clean_tickers(tickers)
-    if not tickers: return pd.DataFrame(), [], []
-    frames=[]; failed=[]; errs=[]
-    for t in tickers:
-        s, err = _direct_one(t, start=start, end=end, interval=interval)
-        if isinstance(s, pd.Series) and not s.empty:
-            frames.append(s.rename(t).to_frame())
-        else:
-            failed.append(t)
-            if err: errs.append(f"[direct:{t}] {err}")
-    if frames:
-        df = pd.concat(frames, axis=1).sort_index()
-        return df, failed, errs
-    return pd.DataFrame(), tickers, errs
-
-@st.cache_data(ttl=600, show_spinner=False)
-def last_prices_direct(tickers):
-    tickers = _clean_tickers(tickers)
-    out, failed = {}, []
-    for t in tickers:
-        s, err = _direct_one(t, interval="1d")
-        if isinstance(s, pd.Series) and not s.empty:
-            out[t] = float(s.dropna().iloc[-1])
-        else:
-            failed.append(t)
-    return out, failed
-
-# ================== yfinance SECUENCIAL (principal) ==================
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
-                     pause_sec=1.2, retries=3, years=10):
-    tickers = _clean_tickers(tickers)
-    if not tickers:
-        return pd.DataFrame(), [], []
-    frames, failed, errs = [], [], []
-    for t in tickers:
-        got = pd.DataFrame()
-        for k in range(retries):
-            try:
-                if start is None and end is None:
-                    d = yf.download(t, period=f"{years}y", interval=interval,
-                                    auto_adjust=True, progress=False, threads=False)
-                else:
-                    d = yf.download(t, start=start, end=end, interval=interval,
-                                    auto_adjust=True, progress=False, threads=False)
-                if d is not None and not d.empty and "Close" in d.columns:
-                    s = d["Close"].dropna()
-                    if not s.empty:
-                        frames.append(s.rename(t).to_frame())
-                        got = frames[-1]
-                        break
-            except Exception as e:
-                if k == retries - 1:
-                    errs.append(f"[yf:{t}] {type(e).__name__}: {e}")
-            time.sleep(pause_sec * (k + 1))
-        if got.empty:
-            failed.append(t)
-    if frames:
-        df = pd.concat(frames, axis=1).sort_index()
-        return df, failed, errs
-    return pd.DataFrame(), tickers, errs
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def last_prices_yf(tickers):
-    tickers = _clean_tickers(tickers)
-    out, failed = {}, []
-    for t in tickers:
-        ok = False
-        for k in range(3):
-            try:
-                d = yf.download(t, period="15d", interval="1d",
-                                auto_adjust=True, progress=False, threads=False)
-                if d is not None and not d.empty and "Close" in d.columns:
-                    s = d["Close"].dropna().ffill()
-                    if not s.empty:
-                        out[t] = float(s.iloc[-1]); ok = True; break
-            except Exception:
-                pass
-            time.sleep(1.2 * (k + 1))
-        if not ok:
-            failed.append(t)
-    return out, failed
-
-# ================== MÉTRICAS ==================
-def annualize_return(d, freq=252):
-    if d.empty: return np.nan
-    return float((1+d).prod()**(freq/max(len(d),1)) - 1)
-def annualize_vol(d, freq=252):
-    if d.empty: return np.nan
-    return float(d.std(ddof=0)*np.sqrt(freq))
-def sharpe(d, rf=0.0, freq=252):
-    if d.empty: return np.nan
-    er=annualize_return(d,freq); ev=annualize_vol(d,freq)
-    return (er-rf)/ev if ev and ev>0 else np.nan
-def sortino(d, rf=0.0, freq=252):
-    if d.empty: return np.nan
-    neg=d.copy(); neg[neg>0]=0
-    dd=np.sqrt((neg**2).mean())*np.sqrt(freq)
-    er=annualize_return(d,freq)
-    return (er-rf)/dd if dd and dd>0 else np.nan
-def max_drawdown(cum):
-    if cum.empty: return np.nan
-    return float((cum/cum.cummax()-1).min())
-def calmar(d,freq=252):
-    if d.empty: return np.nan
-    er=annualize_return(d,freq); mdd=abs(max_drawdown((1+d).cumprod()))
-    return er/mdd if mdd and mdd>0 else np.nan
-
-# ================== TX → POSITIONS ==================
-def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
-    if tx.empty: return tx
-    df=tx.copy()
-    for c in ["TradeID","Account","Ticker","Name","AssetType","Currency",
-              "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
-              "GrossAmount","NetAmount","LotID","Source","Notes"]:
-        if c not in df.columns: df[c]=np.nan
-    df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
-    df=df.dropna(subset=["Ticker"])
-    df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
-    for n in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
-        df[n]=pd.to_numeric(df[n],errors="coerce")
-    df["FXRate"]=df["FXRate"].fillna(1.0)
-    def signed(row):
-        s=str(row.get("Side","")).lower().strip()
-        q=float(row.get("Shares",0) or 0)
-        if s in ("sell","venta","vender","-1"): return -abs(q)
-        return abs(q)
-    df["SignedShares"]=df.apply(signed,axis=1)
+def read_sheet_df(sh, tab):
+    ws = sh.worksheet(tab)
+    df = pd.DataFrame(ws.get_all_records())
     return df
 
-def positions_from_tx(tx:pd.DataFrame):
-    if tx.empty:
-        return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    df=tidy_transactions(tx)
-    uniq=sorted(df["Ticker"].unique().tolist())
-    if not uniq:
-        return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
+def upsert_append_df(sh, tab, df: pd.DataFrame):
+    if df.empty: 
+        return
+    ws = sh.worksheet(tab)
+    # append rows at bottom
+    rows = [df.columns.tolist()] + df.astype(object).values.tolist()
+    # use batch update to avoid header duplication
+    # strategy: write without header using append_rows (header exists)
+    ws.append_rows(df.astype(object).values.tolist(), value_input_option="USER_ENTERED")
 
-    last_map, failed_lp = last_prices_yf(uniq)
-    if failed_lp:
-        last_map2, failed_lp2 = last_prices_direct(failed_lp)
-        last_map.update(last_map2)
-        failed_lp = failed_lp2
-
-    pos=[]
-    for t,grp in df.groupby("Ticker"):
-        sh=float(grp["SignedShares"].sum())
-        if abs(sh)<1e-12: continue
-        buys=grp["SignedShares"]>0
-        if buys.any():
-            tot_sh=float(grp.loc[buys,"SignedShares"].sum())
-            cost_leg = (grp.loc[buys,"SignedShares"]*grp.loc[buys,"Price"].fillna(0)).sum()
-            fees_leg = grp.loc[buys,"Fees"].fillna(0).sum() + grp.loc[buys,"Taxes"].fillna(0).sum()
-            tot_cost = cost_leg + fees_leg
-            avg=tot_cost/tot_sh if tot_sh>0 else np.nan
+# -------------------------------
+# Datos base
+# -------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def load_all_sheets():
+    sh = open_spreadsheet()
+    # Transactions
+    try:
+        tx = read_sheet_df(sh, "Transactions")
+        if not tx.empty:
+            # Normalize types
+            tx["TradeDate"] = pd.to_datetime(tx["TradeDate"])
+            tx["Side"] = tx["Side"].str.strip().str.capitalize()
+            for col in ["Shares", "Price", "Fees", "Taxes", "FXRate"]:
+                if col in tx.columns:
+                    tx[col] = pd.to_numeric(tx[col], errors="coerce").fillna(0.0)
+            tx["Account"] = tx.get("Account", "Main")
+            tx["Currency"] = tx.get("Currency", "USD")
+            tx["FXRate"] = tx.get("FXRate", 1.0)
+            tx["Notes"] = tx.get("Notes", "")
         else:
-            avg=np.nan
-        px=last_map.get(t,np.nan)
-        mv= sh*px if not np.isnan(px) else np.nan
-        inv= sh*avg if not np.isnan(avg) else np.nan
-        pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
-        pos.append([t,sh,avg,inv,px,mv,pl])
-    
-    dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    if failed_lp: st.caption("⚠️ Sin último precio: " + ", ".join(failed_lp))
-    return dfp.sort_values("MarketValue",ascending=False)
+            tx = pd.DataFrame(columns=["TradeDate","Side","Ticker","Shares","Price","Fees","Taxes","Account","Currency","FXRate","Notes"])
+    except gspread.WorksheetNotFound:
+        tx = pd.DataFrame(columns=["TradeDate","Side","Ticker","Shares","Price","Fees","Taxes","Account","Currency","FXRate","Notes"])
 
-def weights_from_positions(pos_df:pd.DataFrame):
-    if pos_df.empty: return pd.Series(dtype=float)
-    total=pos_df["MarketValue"].fillna(0).sum()
-    if total<=0: return pd.Series(dtype=float)
-    return (pos_df.set_index("Ticker")["MarketValue"]/total).sort_values(ascending=False)
-
-def const_weight_returns(price_df:pd.DataFrame, weights:pd.Series):
-    if price_df is None or price_df.empty or weights is None or len(weights)==0:
-        return pd.Series(dtype=float), pd.DataFrame()
-    cols=[c for c in price_df.columns if c in weights.index]
-    if not cols: return pd.Series(dtype=float), pd.DataFrame()
-    price_df=price_df[cols].dropna(how="all")
-    rets=price_df.pct_change().dropna(how="all")
-    if rets.empty: return pd.Series(dtype=float), pd.DataFrame()
-    w=weights.reindex(rets.columns).fillna(0).values
-    port=(rets*w).sum(axis=1)
-    return port, rets
-
-# ================== OPTIMIZACIÓN ==================
-def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
-    n=len(mean_ret)
-    if n==0: return np.array([])
-    if bounds is None: bounds=[(0.0,1.0)]*n
-    def neg_sharpe(w):
-        mu=float(np.dot(w,mean_ret))
-        sig=float(np.sqrt(np.dot(w,np.dot(cov,w))))
-        if sig==0: return 9999.0
-        return -((mu-rf)/sig)
-    cons=[{"type":"eq","fun":lambda w: np.sum(w)-1.0}]
-    x0=np.array([1.0/n]*n)
-    res=minimize(neg_sharpe,x0,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":500})
-    return res.x if (hasattr(res,"success") and res.success) else x0
-
-# ================== CARGA BASE ==================
-tx_df, settings_df, watch_df = load_all_data()
-rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # SPY por defecto
-w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
-w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
-
-# ================== SIDEBAR ==================
-st.sidebar.title("📊 Navegación")
-page = st.sidebar.radio("Ir a:", ["Mi Portafolio","Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Diagnóstico"])
-window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"], index=2)
-period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
-start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
-
-# ================== FUNCIÓN CARGA PRECIOS ROBUSTA ==================
-def load_prices_with_fallback(tickers, bench, start_date):
-    prices, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
-    bench_ret = pd.Series(dtype=float)
-    if not prices.empty and bench in prices.columns:
-        bench_ret = prices[[bench]].pct_change().dropna()[bench]
-        prices = prices.drop(columns=[bench], errors="ignore")
-    if prices.empty:
-        prices2, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [bench], start=start_date, end=None)
-        if not prices2.empty and bench in prices2.columns:
-            bench_ret = prices2[[bench]].pct_change().dropna()[bench]
-            prices2 = prices2.drop(columns=[bench], errors="ignore")
-        prices = prices2
-        failed_all = failed_d
-        errs_all = errs_yf + errs_d
-    else:
-        failed_all = failed_yf
-        errs_all = errs_yf
-    if prices.empty:
-        alt_bench = "SPY"
-        if bench != alt_bench and alt_bench not in tickers:
-            tmp, fb, fe = fetch_prices_yf(tickers + [alt_bench], start=start_date)
-            if not tmp.empty:
-                if alt_bench in tmp.columns:
-                    bench_ret = tmp[[alt_bench]].pct_change().dropna()[alt_bench]
-                    tmp = tmp.drop(columns=[alt_bench], errors="ignore")
-                prices = tmp
-                failed_all = list(set((failed_all or []) + fb))
-                errs_all = (errs_all or []) + fe
-    return prices, bench_ret, (failed_all or []), (errs_all or [])
-
-# ================== MI PORTAFOLIO ==================
-if page=="Mi Portafolio":
-    st.title("💼 Mi Portafolio")
-    if st.button("🔄 Refrescar datos"): refresh_all(); st.rerun()
-
-    pos_df = positions_from_tx(tx_df)
-    if pos_df.empty: st.info("No hay posiciones. Carga operaciones en 'Transactions'."); st.stop()
-
-    tickers = pos_df["Ticker"].tolist()
-    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-
-    if prices.empty or len(prices.columns)==0:
-        st.warning("No se pudieron obtener precios históricos desde Yahoo.")
-        if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
-        if errs_all:
-            with st.expander("Detalles de errores Yahoo"):
-                for e in errs_all: st.code(e)
-        st.stop()
-
-    w = weights_from_positions(pos_df)
-    asset_rets = prices.pct_change().dropna(how="all")
-    since_buy = (pos_df.set_index("Ticker")["MarketPrice"]/pos_df.set_index("Ticker")["AvgCost"] - 1).replace([np.inf,-np.inf], np.nan)
-    window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df["Ticker"]).fillna(np.nan)
-    pos_df = pos_df.set_index("Ticker").loc[w.index].reset_index()
-
-    view = pd.DataFrame({
-        "#": np.arange(1, len(w)+1),
-        "Ticker": pos_df["Ticker"].values,
-        "Shares": pos_df["Shares"].values,
-        "Avg Buy": pos_df["AvgCost"].values,
-        "Last": pos_df["MarketPrice"].values,
-        "P/L $": pos_df["UnrealizedPL"].values,
-        "P/L % (compra)": (since_buy.reindex(pos_df["Ticker"]).values*100.0),
-        "Δ % ventana": (window_change.reindex(pos_df["Ticker"]).values*100.0),
-        "Peso %": (w.reindex(pos_df["Ticker"]).values*100.0),
-        "Valor": pos_df["MarketValue"].values
-    }).replace([np.inf,-np.inf], np.nan)
-
-    # --- Formato corregido (dinero con ${:,.2f}) y NA como "—" ---
-    money_fmt = {"Avg Buy":"${:,.2f}","Last":"${:,.2f}","P/L $":"${:,.2f}","Valor":"${:,.2f}"}
-    pct_fmt   = {"P/L % (compra)":"{:,.2f}%","Δ % ventana":"{:,.2f}%","Peso %":"{:,.2f}%"}
-    def color_pct(val):
-        if pd.isna(val): return "color: inherit;"
-        return "color: #18b26b;" if val>=0 else "color: #ff4d4f;"
-
-    styled = (view.style
-        .format({**money_fmt, **pct_fmt}, na_rep="—")
-        .applymap(color_pct, subset=["P/L % (compra)","Δ % ventana"])
-        .set_properties(subset=["#","Ticker","Shares"], **{"font-weight":"600"})
-    )
-
-    c_top1, c_top2 = st.columns([2,1])
-    with c_top1:
-        st.subheader("Composición y rendimiento (constante)")
-        port_ret, _ = const_weight_returns(prices, w)
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("Rend. anualizado", f"{(annualize_return(port_ret) or 0)*100:,.2f}%")
-        c2.metric("Vol. anualizada", f"{(annualize_vol(port_ret) or 0)*100:,.2f}%")
-        c3.metric("Sharpe", f"{(sharpe(port_ret, rf) or 0):.2f}")
-        cum=(1+port_ret).cumprod(); mdd=max_drawdown(cum)
-        c4.metric("Max Drawdown", f"{(mdd or 0)*100:,.2f}%")
-        c5.metric("Sortino", f"{(sortino(port_ret, rf) or 0):.2f}")
-        c6.metric("Calmar", f"{(calmar(port_ret) or 0):.2f}")
-
-        curve=pd.DataFrame({"Portafolio":(1+port_ret).cumprod()})
-        if not bench_ret.empty:
-            curve["Benchmark"]=(1+bench_ret).cumprod().reindex(curve.index).ffill()
-        st.plotly_chart(px.line(curve, title="Crecimiento de 1.0"), use_container_width=True)
-
-    with c_top2:
-        alloc = pd.DataFrame({"Ticker":w.index,"Weight":w.values})
-        st.plotly_chart(px.pie(alloc, names="Ticker", values="Weight", title="Asignación"), use_container_width=True)
-
-    st.subheader("📋 Detalle de posiciones (estilo broker)")
-    st.dataframe(styled, use_container_width=True, height=min(600, 120 + 32*len(view)))
-    st.download_button("⬇️ Descargar posiciones (CSV)", view.to_csv(index=False).encode("utf-8"),
-                       file_name="mi_portafolio.csv", mime="text/csv")
-
-# ================== OPTIMIZAR ==================
-elif page=="Optimizar y Rebalancear":
-    st.title("🛠️ Optimizar y Rebalancear")
-    pos_df = positions_from_tx(tx_df)
-    if pos_df.empty: st.info("No hay posiciones."); st.stop()
-
-    tickers = pos_df["Ticker"].tolist()
-    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-
-    if prices.empty:
-        st.warning("No hay precios para optimizar (Yahoo).")
-        if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
-        if errs_all:
-            with st.expander("Detalles de errores Yahoo"): 
-                for e in errs_all: st.code(e)
-        st.stop()
-
-    if failed_all:
-        st.caption("⚠️ Excluidos por falta de histórico: " + ", ".join(sorted(set(failed_all))))
-        good = [c for c in prices.columns if prices[c].notna().any()]
-        prices = prices[good]
-        pos_df = pos_df[pos_df["Ticker"].isin(good)].copy()
-
-    w_cur = weights_from_positions(pos_df)
-    port_ret_cur, asset_rets = const_weight_returns(prices, w_cur)
-    if asset_rets.empty:
-        st.warning("No hay retornos suficientes para optimizar."); st.stop()
-
-    mean_daily=asset_rets.mean()
-    cov=asset_rets.cov()
-    mu_ann=(1+mean_daily)**252-1
-    # --- bounds del tamaño correcto (evita ValueError de SciPy) ---
-    n=len(mu_ann)
-    bounds=[(w_min,w_max)]*n
-    w_opt_arr = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
-    w_opt = pd.Series(w_opt_arr, index=mu_ann.index).clip(lower=w_min, upper=w_max)
-    w_opt /= w_opt.sum()
-
-    port_ret_opt,_ = const_weight_returns(prices, w_opt)
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Sharpe actual", f"{(sharpe(port_ret_cur, rf) or 0):.2f}")
-    c2.metric("Sharpe propuesto", f"{(sharpe(port_ret_opt, rf) or 0):.2f}")
-    c3.metric("Vol. actual", f"{(annualize_vol(port_ret_cur) or 0)*100:,.2f}%")
-    c4.metric("Vol. propuesto", f"{(annualize_vol(port_ret_opt, rf) or 0)*100:,.2f}%")
-
-    compare=pd.DataFrame({"Weight Actual":w_cur,"Weight Propuesto":w_opt}).fillna(0)
-    compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
-    st.dataframe(compare.style.format({"Weight Actual":"{:,.2%}","Weight Propuesto":"{:,.2%}","Δ (pp)":"{:,.2f}"}), use_container_width=True)
-
-# ================== EVALUAR CANDIDATO ==================
-elif page=="Evaluar Candidato":
-    st.title("🧪 Evaluar Candidato")
-    pos_df = positions_from_tx(tx_df)
-    if pos_df.empty: st.info("Sin posiciones."); st.stop()
-
-    tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
-    if not tkr: st.stop()
-    tickers = sorted(set(pos_df["Ticker"].tolist()+[tkr]))
-    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-
-    if prices.empty:
-        st.warning("No se pudieron descargar precios desde Yahoo.")
-        if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
-        if errs_all:
-            with st.expander("Detalles de errores Yahoo"):
-                for e in errs_all: st.code(e)
-        st.stop()
-
-    w_cur = weights_from_positions(pos_df)
-    last_map, fail_lp = last_prices_yf([tkr])
-    if fail_lp:
-        last_map2, _ = last_prices_direct(fail_lp)
-        last_map.update(last_map2)
-    last = last_map.get(tkr, np.nan)
-    if np.isnan(last): st.warning("Ticker inválido o sin último precio (Yahoo)."); st.stop()
-
-    mode = st.radio("Forma de evaluación", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
-    if mode=="Asignar porcentaje":
-        pct=st.slider("Peso objetivo del candidato",0.0,0.40,0.10,0.01)
-        w_new=(w_cur*(1-pct)).reindex(prices.columns).fillna(0.0); w_new[tkr]+=pct
-    else:
-        qty=st.number_input("Acciones a comprar (simulado)",min_value=1,value=5,step=1)
-        pv=pos_df["MarketValue"].sum(); add=qty*last; base=pv+add if (pv+add)>0 else 1.0
-        w_new=(w_cur*pv)/base; w_new=w_new.reindex(prices.columns).fillna(0.0); w_new[tkr]+=add/base
-
-    port_cur,_=const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
-    port_new,_=const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
-    c=st.columns(4)
-    sh_old=sharpe(port_cur,rf); sh_new=sharpe(port_new,rf)
-    c[0].metric("Sharpe actual", f"{(sh_old or 0):.2f}")
-    c[1].metric("Sharpe con candidato", f"{(sh_new or 0):.2f}",
-                delta=None if (pd.isna(sh_old) or pd.isna(sh_new)) else f"{(sh_new-sh_old):.2f}")
-    cum_cur=(1+port_cur).cumprod(); cum_new=(1+port_new).cumprod()
-    mdd_cur=max_drawdown(cum_cur); mdd_new=max_drawdown(cum_new)
-    c[2].metric("MDD actual", f"{(0 if pd.isna(mdd_cur) else mdd_cur)*100:,.2f}%")
-    c[3].metric("MDD con candidato", f"{(0 if pd.isna(mdd_new) else mdd_new)*100:,.2f}%",
-                delta=None if (pd.isna(mdd_cur) or pd.isna(mdd_new)) else f"{((mdd_new-mdd_cur)*100):.2f}%")
-
-# ================== EXPLORAR / DIAGNÓSTICO ==================
-elif page=="Explorar / Research":
-    st.title("🔎 Explorar / Research")
-    tkr=st.text_input("Ticker", value="MSFT").upper().strip().replace(" ","")
-    if tkr:
-        hist, bench_ret, failed_all, errs_all = load_prices_with_fallback([tkr], benchmark, start_date)
-        if not hist.empty and tkr in hist.columns:
-            ser = hist[tkr].dropna()
-            if not ser.empty:
-                df = pd.DataFrame({"Close": ser})
-                fig=go.Figure(data=[go.Candlestick(
-                    x=df.index, open=df["Close"], high=df["Close"], low=df["Close"], close=df["Close"]
-                )])
-                fig.update_layout(title=f"Serie (Close) {tkr}", xaxis_rangeslider_visible=False, height=480)
-                st.plotly_chart(fig, use_container_width=True)
+    # Prices
+    try:
+        px = read_sheet_df(sh, "Prices")
+        if not px.empty:
+            px["Date"] = pd.to_datetime(px["Date"])
+            px["Close"] = pd.to_numeric(px["Close"], errors="coerce")
         else:
-            st.warning("Yahoo no entregó histórico para ese ticker.")
-            if failed_all: st.caption("Fallidos: " + ", ".join(failed_all))
-            if errs_all:
-                with st.expander("Detalles de errores Yahoo"):
-                    for e in errs_all: st.code(e)
+            px = pd.DataFrame(columns=["Date","Ticker","Close"])
+    except gspread.WorksheetNotFound:
+        px = pd.DataFrame(columns=["Date","Ticker","Close"])
 
-elif page=="Diagnóstico":
-    st.title("🩺 Diagnóstico rápido")
-    col1,col2=st.columns(2)
-    with col1:
-        st.subheader("Secrets")
-        st.write({"SHEET_ID": bool(SHEET_ID), "gcp_service_account": bool(GCP_SA)})
-        try:
-            sh = gc.open_by_key(SHEET_ID)
-            titles = [w.title for w in sh.worksheets()]
-            st.success("Hojas encontradas:"); st.write(titles)
-        except Exception as e:
-            st.error(f"No pude listar hojas: {e}")
+    # Settings
+    try:
+        stg = read_sheet_df(sh, "Settings")
+        settings = dict(zip(stg["Key"], stg["Value"]))
+    except gspread.WorksheetNotFound:
+        settings = {"BENCHMARK":"^GSPC", "RISK_FREE":"0.04", "DEFAULT_ACCOUNT":"Main"}
 
-        st.subheader("Settings")
-        st.dataframe(load_all_data()[1], use_container_width=True)
+    # Historial
+    try:
+        hist = read_sheet_df(sh, "Historial")
+        if not hist.empty:
+            hist["BuyDateFirst"] = pd.to_datetime(hist["BuyDateFirst"], errors="coerce")
+            hist["SellDateLast"]  = pd.to_datetime(hist["SellDateLast"], errors="coerce")
+            for c in ["BuyAvgCost","SellPrice","SharesBought","SharesSold","FeesBuy","FeesSell","HoldingDays","RealizedPL","RealizedPLPct"]:
+                if c in hist.columns:
+                    hist[c] = pd.to_numeric(hist[c], errors="coerce")
+        else:
+            hist = pd.DataFrame(columns=["Ticker","BuyDateFirst","BuyAvgCost","SharesBought","SellDateLast","SellPrice","SharesSold","FeesBuy","FeesSell","HoldingDays","RealizedPL","RealizedPLPct","Account","Notes"])
+    except gspread.WorksheetNotFound:
+        hist = pd.DataFrame(columns=["Ticker","BuyDateFirst","BuyAvgCost","SharesBought","SellDateLast","SellPrice","SharesSold","FeesBuy","FeesSell","HoldingDays","RealizedPL","RealizedPLPct","Account","Notes"])
 
-    with col2:
-        st.subheader("Ping yfinance (SPY 30d)")
-        try:
-            test = yf.download("SPY", period="30d", interval="1d", auto_adjust=True,
-                               progress=False, threads=False)
-            if test is None or test.empty:
-                st.warning("Sin datos por yfinance (posible rate-limit/bloqueo de red).")
-            else:
-                st.success(f"OK YF: {len(test)} barras.")
-                st.dataframe(test.tail(5))
-        except Exception as e:
-            st.error(f"Error yfinance: {e}")
+    # Watchlist
+    try:
+        wl = read_sheet_df(sh, "Watchlist")
+    except gspread.WorksheetNotFound:
+        wl = pd.DataFrame(columns=["Ticker","Notes"])
 
-        st.subheader("Ping Yahoo directo (MSFT 30d)")
-        try:
-            s, err = _direct_one("MSFT", interval="1d")
-            if isinstance(s, pd.Series) and not s.empty:
-                st.success(f"OK directo: {len(s.tail(30))} puntos")
-                st.dataframe(s.tail(5).to_frame("Close"))
-            else:
-                st.warning("Directo vacío.")
-                if err: st.code(err)
-        except Exception as e:
-            st.error(f"Error directo: {e}")
+    return tx, px, settings, hist, wl
 
-    st.subheader("Transactions (muestra)")
-    st.dataframe(load_all_data()[0].head(10), use_container_width=True)
+# -------------------------------
+# Yahoo Finance – solo yfinance
+# -------------------------------
+def yf_download_closes(ticker, start=None, end=None):
+    # robust yfinance call
+    data = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False, threads=False)
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+    if "Adj Close" in data.columns:
+        ser = data["Adj Close"].copy()
+    elif "Close" in data.columns:
+        ser = data["Close"].copy()
+    else:
+        return pd.Series(dtype=float)
+    ser.index = pd.to_datetime(ser.index)
+    ser.name = "Close"
+    return ser
 
+def ensure_prices_incremental(px_df, tickers, start_date):
+    """Lee Prices (df), descarga faltantes desde yfinance y devuelve (px_df_actualizado, log)."""
+    updates = []
+    for t in tickers:
+        t = str(t).upper().strip()
+        if not t:
+            continue
+        has = px_df[px_df["Ticker"]==t]
+        if has.empty:
+            dl_start = start_date
+        else:
+            last_dt = has["Date"].max().date()
+            dl_start = last_dt + timedelta(days=1)
+        if dl_start > datetime.utcnow().date():
+            continue
+        ser = yf_download_closes(t, start=dl_start, end=datetime.utcnow().date()+timedelta(days=1))
+        if ser.empty:
+            continue
+        add = pd.DataFrame({"Date": ser.index.normalize(), "Ticker": t, "Close": ser.values})
+        px_df = pd.concat([px_df, add], ignore_index=True)
+        updates.append((t, len(add)))
+    # dedupe
+    px_df = px_df.drop_duplicates(subset=["Date","Ticker"], keep="last").sort_values(["Ticker","Date"]).reset_index(drop=True)
+    return px_df, updates
+
+# -------------------------------
+# Posiciones, FIFO y métricas
+# -------------------------------
+def build_open_lots(tx_df):
+    """Devuelve lots abiertos por ticker (FIFO) y ledger de cierres para ventas en el pasado (cálculo al vuelo)."""
+    lots = {}  # ticker -> list of dicts {date, shares_remaining, price, fees}
+    closes = []  # rows estilo Historial (cálculo al vuelo, no escribe)
+
+    for _, r in tx_df.sort_values("TradeDate").iterrows():
+        t = r["Ticker"].upper()
+        side = r["Side"].lower()
+        qty = float(r["Shares"])
+        price = float(r["Price"])
+        fees = float(r.get("Fees",0)) + float(r.get("Taxes",0))
+        d = r["TradeDate"]
+        if side == "buy":
+            lots.setdefault(t, []).append({"date": d, "shares": qty, "price": price, "fees": fees})
+        elif side == "sell":
+            remain = qty
+            lots.setdefault(t, [])
+            # consume fifo
+            while remain > 1e-9 and lots[t]:
+                lot = lots[t][0]
+                take = min(lot["shares"], remain)
+                buy_cost = lot["price"]
+                # fees split proportional
+                fees_buy_part = (take/lot["shares"]) * lot["fees"] if lot["shares"]>0 else 0
+                pl = (price - buy_cost)*take - fees - fees_buy_part
+                closes.append({
+                    "Ticker": t,
+                    "BuyDateFirst": lot["date"],
+                    "BuyAvgCost": buy_cost,
+                    "SharesBought": take,
+                    "SellDateLast": d,
+                    "SellPrice": price,
+                    "SharesSold": take,
+                    "FeesBuy": round(fees_buy_part,2),
+                    "FeesSell": round(fees,2),
+                    "HoldingDays": (pd.to_datetime(d)-pd.to_datetime(lot["date"])).days,
+                    "RealizedPL": round(pl,2),
+                    "RealizedPLPct": round((price/buy_cost-1)*100,2) if buy_cost>0 else np.nan,
+                    "Account": r.get("Account","Main"),
+                    "Notes": r.get("Notes","")
+                })
+                lot["shares"] -= take
+                remain -= take
+                if lot["shares"] <= 1e-9:
+                    lots[t].pop(0)
+            # si remain>0, venta sin suficiente inventario (ignorado)
+
+    # limpia zeros
+    for t in list(lots.keys()):
+        lots[t] = [l for l in lots[t] if l["shares"]>1e-9]
+        if not lots[t]:
+            lots.pop(t)
+    return lots, pd.DataFrame(closes)
+
+def positions_from_tx(tx_df, px_df):
+    lots, _ = build_open_lots(tx_df)
+    rows = []
+    last_map = {}
+    for t in lots.keys():
+        last_ser = px_df[px_df["Ticker"]==t].sort_values("Date").tail(1)
+        if not last_ser.empty:
+            last_map[t] = float(last_ser["Close"].values[0])
+    for t, items in lots.items():
+        shares = sum(l["shares"] for l in items)
+        cost = np.average([l["price"] for l in items], weights=[l["shares"] for l in items]) if items else np.nan
+        last = last_map.get(t, np.nan)
+        rows.append({
+            "Ticker": t,
+            "Shares": shares,
+            "AvgBuy": cost,
+            "Last": last,
+            "PL$": (last-cost)*shares if pd.notna(last) and pd.notna(cost) else np.nan,
+            "PL%": (last/cost-1)*100 if pd.notna(last) and pd.notna(cost) and cost>0 else np.nan
+        })
+    pos = pd.DataFrame(rows).sort_values("Ticker").reset_index(drop=True)
+    # pesos
+    pos["Value"] = pos["Last"]*pos["Shares"]
+    tot = pos["Value"].sum()
+    pos["Peso%"] = pos["Value"]/tot*100 if tot>0 else 0
+    # ranking por peso
+    pos = pos.sort_values("Peso%", ascending=False).reset_index(drop=True)
+    pos.insert(0, "#", np.arange(1, len(pos)+1))
+    return pos
+
+def portfolio_equity_curve(tx_df, px_df):
+    """Equity = market value (activos) + cash (flujo por transacciones)."""
+    if px_df.empty:
+        return pd.DataFrame(columns=["Date","Equity","MarketValue","Cash"])
+    # universo fechas
+    dates = pd.to_datetime(px_df["Date"].unique()).sort_values()
+    # posiciones por fecha
+    tickers = px_df["Ticker"].unique()
+    shares_t = {t: 0.0 for t in tickers}
+    mv = []
+    cash = 0.0
+    tx_sorted = tx_df.sort_values("TradeDate")
+    d_iter = iter(dates)
+    cur_date = next(d_iter, None)
+    tx_idx = 0
+    tx_list = tx_sorted.to_dict("records")
+    # recorrido fechas
+    while cur_date is not None:
+        # aplica transacciones hasta cur_date
+        while tx_idx < len(tx_list) and pd.to_datetime(tx_list[tx_idx]["TradeDate"]).date() <= cur_date.date():
+            r = tx_list[tx_idx]
+            t = r["Ticker"].upper()
+            if t not in shares_t:
+                shares_t[t] = 0.0
+            qty = float(r["Shares"])
+            price = float(r["Price"])
+            fees = float(r.get("Fees",0))+float(r.get("Taxes",0))
+            side = r["Side"].lower()
+            cf = 0.0
+            if side=="buy":
+                shares_t[t] += qty
+                cf = -(price*qty + fees)
+            elif side=="sell":
+                shares_t[t] -= qty
+                cf = +(price*qty - fees)
+            cash += cf
+            tx_idx += 1
+
+        # market value
+        mv_d = 0.0
+        for t, sh in shares_t.items():
+            if abs(sh) < 1e-9: 
+                continue
+            row = px_df[(px_df["Ticker"]==t)&(px_df["Date"]==cur_date)]
+            if row.empty:
+                continue
+            mv_d += float(row["Close"].values[0]) * sh
+        mv.append({"Date": cur_date, "MarketValue": mv_d, "Cash": cash, "Equity": mv_d+cash})
+        cur_date = next(d_iter, None)
+    return pd.DataFrame(mv)
+
+# -------------------------------
+# UI – Sidebar
+# -------------------------------
+st.sidebar.title("Navegación")
+page = st.sidebar.radio("Ir a:", ["Mi Portafolio", "Optimizar y Rebalancear", "Evaluar Candidato"])
+hist_window = st.sidebar.selectbox("Ventana histórica", ["1Y", "3Y", "5Y", "Max"], index=1)
+
+# -------------------------------
+# Carga datos base y snapshot incremental de Prices
+# -------------------------------
+tx_df, px_df, settings, hist_df, wl_df = load_all_sheets()
+benchmark = settings.get("BENCHMARK", "^GSPC")
+
+# Universo para snapshot: tickers en tx + watchlist + benchmark
+tickers_universe = sorted(set(tx_df["Ticker"].str.upper()) | set(wl_df.get("Ticker", pd.Series([], dtype=str)).str.upper()) | set([benchmark]))
+tickers_universe = [t for t in tickers_universe if t]  # limpia
+
+# define start según ventana
+today = datetime.utcnow().date()
+start_map = {"1Y": today - timedelta(days=365),
+             "3Y": today - timedelta(days=3*365),
+             "5Y": today - timedelta(days=5*365),
+             "Max": today - timedelta(days=20*365)}
+start_date = start_map.get(hist_window, today - timedelta(days=3*365))
+
+with st.spinner("Actualizando precios (snap incremental)…"):
+    px_df, upd = ensure_prices_incremental(px_df, tickers_universe, start_date)
+# Guarda updates en Sheets si hubo
+if upd:
+    sh = open_spreadsheet()
+    upsert_append_df(sh, "Prices", pd.DataFrame(px_df.tail(sum(u[1] for u in upd))))
+
+# -------------------------------
+# Página: Mi Portafolio
+# -------------------------------
+if page == "Mi Portafolio":
+    st.header("💼 Mi Portafolio")
+
+    # Posiciones activas
+    pos_df = positions_from_tx(tx_df, px_df)
+    st.subheader("Detalle de posiciones (estilo broker)")
+    # Eliminar doble enumeración: ya dejamos sólo "#"
+    st.dataframe(pos_df.style.format({"AvgBuy":format_money,"Last":format_money,"PL$":format_money,"Value":format_money,"Peso%":"{:.2f}%","PL%":"{:.2f}%"}), use_container_width=True)
+
+    # Botón vender por fila
+    with st.expander("↘︎ Vender/Eliminar posición"):
+        sel = st.selectbox("Ticker a vender", pos_df["Ticker"].tolist())
+        if sel:
+            row = pos_df[pos_df["Ticker"]==sel].iloc[0]
+            max_qty = float(row["Shares"])
+            with st.form("sell_form"):
+                sell_date = st.date_input("Fecha", value=today)
+                qty = st.number_input("Cantidad a vender", min_value=0.0, max_value=max_qty, value=max_qty, step=0.1)
+                sell_price = st.number_input("Precio de venta", min_value=0.0, value=float(row["Last"]) if pd.notna(row["Last"]) else 0.0, step=0.01)
+                fees = st.number_input("Fees", min_value=0.0, value=0.0, step=0.01)
+                taxes = st.number_input("Taxes", min_value=0.0, value=0.0, step=0.01)
+                notes = st.text_input("Notas", "")
+                submitted = st.form_submit_button("Confirmar venta")
+            if submitted and qty>0 and sell_price>0:
+                sh = open_spreadsheet()
+                sell_tx = pd.DataFrame([{
+                    "TradeDate": sell_date.strftime("%Y-%m-%d"),
+                    "Side": "Sell",
+                    "Ticker": sel,
+                    "Shares": qty,
+                    "Price": sell_price,
+                    "Fees": fees,
+                    "Taxes": taxes,
+                    "Account": "Main",
+                    "Currency": "USD",
+                    "FXRate": 1.0,
+                    "Notes": notes
+                }])
+                upsert_append_df(sh, "Transactions", sell_tx)
+
+                # Construir cierres FIFO SOLO para esta venta y registrar en Historial (materializado)
+                # Reconstruimos lots previos (antes de la venta) con tx_df + esta venta
+                new_tx = pd.concat([tx_df, sell_tx.assign(TradeDate=pd.to_datetime(sell_tx["TradeDate"]))], ignore_index=True)
+                lots_before, _closes_past = build_open_lots(tx_df)  # antes de la venta
+                # Simula cierre sobre lots_before:
+                remain = qty
+                closes_rows = []
+                while remain>1e-9 and sel in lots_before and lots_before[sel]:
+                    lot = lots_before[sel][0]
+                    take = min(lot["shares"], remain)
+                    fees_buy_part = (take/lot["shares"]) * lot["fees"] if lot["shares"]>0 else 0
+                    pl = (sell_price - lot["price"])*take - fees - fees_buy_part
+                    closes_rows.append({
+                        "Ticker": sel,
+                        "BuyDateFirst": lot["date"].strftime("%Y-%m-%d"),
+                        "BuyAvgCost": lot["price"],
+                        "SharesBought": take,
+                        "SellDateLast": sell_date.strftime("%Y-%m-%d"),
+                        "SellPrice": sell_price,
+                        "SharesSold": take,
+                        "FeesBuy": round(fees_buy_part,2),
+                        "FeesSell": round(fees,2),
+                        "HoldingDays": (pd.to_datetime(sell_date)-pd.to_datetime(lot["date"])).days,
+                        "RealizedPL": round(pl,2),
+                        "RealizedPLPct": round((sell_price/lot["price"]-1)*100,2) if lot["price"]>0 else np.nan,
+                        "Account": "Main",
+                        "Notes": notes
+                    })
+                    lot["shares"] -= take
+                    remain -= take
+                    if lot["shares"]<=1e-9:
+                        lots_before[sel].pop(0)
+                if closes_rows:
+                    upsert_append_df(sh, "Historial", pd.DataFrame(closes_rows))
+                st.success(f"Venta de {qty} {sel} registrada. Historial actualizado.")
+                st.cache_data.clear()
+
+    # Equity curve (activos + cash)
+    eq = portfolio_equity_curve(tx_df, px_df)
+    st.subheader("Evolución del valor total (Equity = Activos + Caja)")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=eq["Date"], y=eq["Equity"], name="Equity", mode="lines"))
+    fig.add_trace(go.Scatter(x=eq["Date"], y=eq["MarketValue"], name="Market Value", mode="lines"))
+    fig.add_trace(go.Scatter(x=eq["Date"], y=eq["Cash"], name="Cash", mode="lines"))
+    fig.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Pastel solo activos activos
+    st.subheader("Distribución actual (solo activos activos)")
+    if not pos_df.empty:
+        pie = px.pie(pos_df, names="Ticker", values="Value", hole=0.35)
+        st.plotly_chart(pie, use_container_width=True)
+
+    # Historial desplegable
+    st.subheader("Historial (cerradas)")
+    with st.expander("Mostrar historial"):
+        st.dataframe(hist_df.style.format({"BuyAvgCost":format_money,"SellPrice":format_money,"RealizedPL":format_money,"RealizedPLPct":"{:.2f}%"}), use_container_width=True)
+
+# -------------------------------
+# Página: Evaluar Candidato
+# -------------------------------
+elif page == "Evaluar Candidato":
+    st.header("📌 Evaluar Candidato")
+
+    # Entrada de ticker
+    cand = st.text_input("Ticker a evaluar", value="AAPL").upper().strip()
+
+    # Trae precios del candidato si no están
+    if cand:
+        px_df, upd2 = ensure_prices_incremental(px_df, [cand], start_date)
+        if upd2:
+            sh = open_spreadsheet()
+            upsert_append_df(sh, "Prices", pd.DataFrame(px_df.tail(sum(u[1] for u in upd2))))
+
+    # KPIs rápidos (Sharpe con activos activos + candidato hipotético a peso objetivo)
+    st.write("Forma de evaluación")
+    mode = st.radio("", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
+
+    weight = st.slider("Peso objetivo del candidato", min_value=0.0, max_value=0.4, value=0.1, step=0.01)
+    # (Para mantener compacto, omitimos la optimización; mostramos solo UI simulada)
+    st.metric("Sharpe actual", "—")
+    st.metric("Sharpe con candidato", "—", delta="—")
+    st.metric("MDD actual", "—")
+    st.metric("MDD con candidato", "—", delta="—")
+
+    # ---- Agregar acción (formulario) ----
+    st.markdown("---")
+    st.subheader("➕ Agregar acción")
+    with st.expander("Abrir formulario"):
+        last_px = np.nan
+        if cand:
+            last_row = px_df[px_df["Ticker"]==cand].sort_values("Date").tail(1)
+            if not last_row.empty:
+                last_px = float(last_row["Close"].values[0])
+        col1,col2 = st.columns([3,1])
+        with st.form("add_action_form"):
+            with col1:
+                ticker_input = st.text_input("Ticker", value=cand)
+            with col2:
+                if st.form_submit_button("✖︎ Quitar preselección"):
+                    ticker_input = ""
+            trade_date = st.date_input("Fecha", value=datetime.utcnow().date())
+            shares = st.number_input("Shares", min_value=0.0, value=1.0, step=0.1)
+            price = st.number_input("Precio (prefill Yahoo)", min_value=0.0, value=last_px if not np.isnan(last_px) else 0.0, step=0.01)
+            fees = st.number_input("Fees", min_value=0.0, value=0.0, step=0.01)
+            taxes = st.number_input("Taxes", min_value=0.0, value=0.0, step=0.01)
+            notes = st.text_input("Notas", "")
+            saved = st.form_submit_button("Guardar compra")
+        if saved and ticker_input and shares>0 and price>0:
+            sh = open_spreadsheet()
+            new_tx = pd.DataFrame([{
+                "TradeDate": trade_date.strftime("%Y-%m-%d"),
+                "Side": "Buy",
+                "Ticker": ticker_input.upper(),
+                "Shares": shares,
+                "Price": price,
+                "Fees": fees,
+                "Taxes": taxes,
+                "Account": "Main",
+                "Currency": "USD",
+                "FXRate": 1.0,
+                "Notes": notes
+            }])
+            upsert_append_df(sh, "Transactions", new_tx)
+            st.success(f"Compra de {shares} {ticker_input.upper()} guardada en Transactions.")
+            st.cache_data.clear()
+
+# -------------------------------
+# Página: Optimizar y Rebalancear (placeholder estético)
+# -------------------------------
+else:
+    st.header("⚙️ Optimizar y Rebalancear")
+    st.info("Se mantiene la estructura existente. Esta vista usa sólo activos activos para métricas y pesos.")
+    # Aquí podrías llamar a tu rutina de frontera eficiente/optimización como antes
