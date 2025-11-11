@@ -3,4 +3,9 @@ base="dark"
 primaryColor="#7c6cff"
 backgroundColor="#0b0f1a"
 secondaryBackgroundColor="#141927"
-textColor="#ffffff"
+textColor="#e6e6e6"
+font="sans serif"
+
+[client]
+toolbarMode="viewer"
+showErrorDetails=false
