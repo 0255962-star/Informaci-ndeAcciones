@@ -8,4 +8,5 @@ font="sans serif"
 
 [client]
 toolbarMode="viewer"
-showErrorDetails=false
+showErrorDetails=true
+
