@@ -1,9 +1,11 @@
 [theme]
-base = "dark"
-primaryColor = "#7c4dff"
-backgroundColor = "#0f1216"
-secondaryBackgroundColor = "#161a22"
-textColor = "#ffffff"
+base="dark"
+primaryColor="#7c5cff"
+backgroundColor="#0f1116"
+secondaryBackgroundColor="#171923"
+textColor="#e6e6e6"
+font="sans serif"
 
-[server]
-headless = true
+[client]
+toolbarMode="viewer"
+showErrorDetails=false
