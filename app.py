@@ -1,4 +1,8 @@
-# APP Finanzas – Portafolio Activo (solo Yahoo Finance, robusto)
+# APP Finanzas – Portafolio Activo (Yahoo + Fallback en Sheets)
+# - Fuente única: Yahoo Finance (yfinance)
+# - Fallback automático: hoja "PricesCache" en tu mismo Google Sheet
+# - Incluye reintentos con backoff y diagnóstico
+
 from datetime import datetime, timedelta
 import os, time, random
 import numpy as np
@@ -7,11 +11,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# --- Google Sheets (usa secrets) ---
+# === Google Sheets (usa secrets) ===
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- HTTP / Yahoo session robusta ---
+# === HTTP / Yahoo session robusta ===
 import requests
 from requests.adapters import HTTPAdapter
 try:
@@ -74,19 +78,17 @@ def make_yf_session():
         )
         ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
         s.mount("https://", ad); s.mount("http://", ad)
-    # atributo informal que yfinance lee para timeout
     s.timeout = 30
     return s
 
 YF_SESSION = make_yf_session()
 
 def _sleep_backoff(k: int):
-    # backoff exponencial + jitter (evita sincronizar el rate-limit)
     time.sleep((0.8 + 0.4*random.random()) * (k + 1))
 
 # ================== CACHES ==================
 def refresh_all():
-    for f in (read_sheet, load_all_data, fetch_prices_yf, last_prices_yf):
+    for f in (read_sheet, load_all_data, fetch_prices_yf, last_prices_yf, read_prices_cache):
         try: f.clear()
         except Exception: pass
     try: st.cache_data.clear()
@@ -344,6 +346,64 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
     res=minimize(neg_sharpe,x0,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":500})
     return res.x if (hasattr(res,"success") and res.success) else x0
 
+# ================== CACHE EN SHEETS (PricesCache) ==================
+@st.cache_data(ttl=300, show_spinner=False)
+def read_prices_cache():
+    """Lee la hoja 'PricesCache' (Date, Ticker, Close) y la devuelve pivot (index=Date, cols=Ticker)."""
+    try:
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet("PricesCache")
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty:
+            return pd.DataFrame()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_localize(None)
+        df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ", "", regex=False)
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df = df.dropna(subset=["Date", "Ticker", "Close"])
+        pivot = (df.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
+                   .sort_index())
+        return pivot
+    except Exception:
+        return pd.DataFrame()
+
+# ================== CARGA DE PRECIOS con fallback a PricesCache ==================
+def load_prices_with_fallback(tickers, bench, start_date):
+    # 1) Live Yahoo (3 rutas + reintentos)
+    prices, bench_ret, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
+
+    if prices is not None and not prices.empty and len(prices.columns) > 0:
+        if bench in prices.columns:
+            bser = prices[[bench]].pct_change().dropna()[bench]
+            prices = prices.drop(columns=[bench], errors="ignore")
+            return prices, bser, failed_yf or [], errs_yf or []
+        else:
+            return prices, pd.Series(dtype=float), failed_yf or [], errs_yf or []
+
+    # 2) Fallback: leer de PricesCache (Yahoo predescargado)
+    cache = read_prices_cache()
+    if cache is not None and not cache.empty:
+        if start_date:
+            try:
+                cache = cache[cache.index >= pd.to_datetime(start_date)]
+            except Exception:
+                pass
+
+        cols = [c for c in _clean_tickers(tickers) if c in cache.columns]
+        p = cache[cols] if cols else pd.DataFrame()
+        bser = pd.Series(dtype=float)
+        if bench in cache.columns:
+            bb = cache[[bench]]
+            if not bb.empty:
+                bser = bb.pct_change().dropna()[bench]
+
+        if p is not None and not p.empty:
+            note = "[cache] Yahoo no respondió; usando PricesCache."
+            errs_yf = (errs_yf or []) + [note]
+            return p, bser, [], errs_yf
+
+    # 3) Nada disponible
+    return pd.DataFrame(), pd.Series(dtype=float), (failed_yf or []), (errs_yf or [])
+
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
@@ -357,15 +417,6 @@ page = st.sidebar.radio("Ir a:", ["Mi Portafolio","Optimizar y Rebalancear","Eva
 window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"], index=2)
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
-
-def load_prices_with_fallback(tickers, bench, start_date):
-    # Solo yfinance (3 rutas); sin librerías extra
-    prices, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
-    bench_ret = pd.Series(dtype=float)
-    if not prices.empty and bench in prices.columns:
-        bench_ret = prices[[bench]].pct_change().dropna()[bench]
-        prices = prices.drop(columns=[bench], errors="ignore")
-    return prices, bench_ret, (failed_yf or []), (errs_yf or [])
 
 # ================== MI PORTAFOLIO ==================
 if page=="Mi Portafolio":
@@ -382,7 +433,7 @@ if page=="Mi Portafolio":
         st.warning("No se pudieron obtener precios históricos desde Yahoo.")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
         if errs_all:
-            with st.expander("Detalles de errores Yahoo"):
+            with st.expander("Detalles de errores Yahoo / Cache"):
                 for e in errs_all: st.code(e)
         st.stop()
 
@@ -454,10 +505,10 @@ elif page=="Optimizar y Rebalancear":
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
 
     if prices.empty:
-        st.warning("No hay precios para optimizar (Yahoo).")
+        st.warning("No hay precios para optimizar (Yahoo/Cache).")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
         if errs_all:
-            with st.expander("Detalles de errores Yahoo"): 
+            with st.expander("Detalles de errores Yahoo / Cache"): 
                 for e in errs_all: st.code(e)
         st.stop()
 
@@ -501,10 +552,10 @@ elif page=="Evaluar Candidato":
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
 
     if prices.empty:
-        st.warning("No se pudieron descargar precios desde Yahoo.")
+        st.warning("No se pudieron descargar precios desde Yahoo/Cache.")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
         if errs_all:
-            with st.expander("Detalles de errores Yahoo"):
+            with st.expander("Detalles de errores Yahoo / Cache"):
                 for e in errs_all: st.code(e)
         st.stop()
 
@@ -551,10 +602,10 @@ elif page=="Explorar / Research":
                 fig.update_layout(title=f"Serie (Close) {tkr}", xaxis_rangeslider_visible=False, height=480)
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Yahoo no entregó histórico para ese ticker.")
+            st.warning("Yahoo/Cache no entregó histórico para ese ticker.")
             if failed_all: st.caption("Fallidos: " + ", ".join(failed_all))
             if errs_all:
-                with st.expander("Detalles de errores Yahoo"):
+                with st.expander("Detalles de errores Yahoo / Cache"):
                     for e in errs_all: st.code(e)
 
 elif page=="Diagnóstico":
@@ -575,7 +626,6 @@ elif page=="Diagnóstico":
 
     with col2:
         st.subheader("Ping yfinance / Yahoo")
-        # Test directo a un endpoint de Yahoo para ver si hay bloqueo de red
         try:
             r = YF_SESSION.get("https://query1.finance.yahoo.com/v7/finance/options/SPY", timeout=10)
             st.write(f"GET options/SPY → {r.status_code}")
@@ -594,3 +644,4 @@ elif page=="Diagnóstico":
                 st.dataframe(test.tail(5))
         except Exception as e:
             st.error(f"Error yfinance: {e}")
+
