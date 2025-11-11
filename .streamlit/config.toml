@@ -1,12 +1,11 @@
 [theme]
-base="dark"
-primaryColor="#7c6cff"
-backgroundColor="#0b0f1a"
-secondaryBackgroundColor="#141927"
-textColor="#e6e6e6"
-font="sans serif"
+base = "dark"
+primaryColor = "#7c6cff"
+backgroundColor = "#0b0f1a"
+secondaryBackgroundColor = "#141927"
+textColor = "#e6e6e6"
+font = "sans serif"
 
 [client]
-toolbarMode="viewer"
-showErrorDetails=true
-
+toolbarMode = "viewer"
+showErrorDetails = true
