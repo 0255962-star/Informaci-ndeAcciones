@@ -1,23 +1,26 @@
-# APP Finanzas – Portafolio Activo (yfinance con sesión propia + backoff)
-from datetime import datetime, timedelta, timezone
-import os, time, json
+# APP Finanzas – Portafolio Activo (solo Yahoo Finance, robusto)
+from datetime import datetime, timedelta
+import os, time, random
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-import requests
-import yfinance as yf
-from scipy.optimize import minimize
 
+# --- Google Sheets (usa secrets) ---
 import gspread
 from google.oauth2.service_account import Credentials
+
+# --- HTTP / Yahoo session robusta ---
+import requests
 from requests.adapters import HTTPAdapter
 try:
-    # Retry está en urllib3 de requests
     from urllib3.util.retry import Retry
 except Exception:
     Retry = None
+
+import yfinance as yf
+from scipy.optimize import minimize
 
 # ================== CONFIG UI ==================
 st.set_page_config(page_title="APP Finanzas – Portafolio Activo", page_icon="💼", layout="wide")
@@ -37,19 +40,20 @@ div[data-testid="stMetricValue"]{font-size:1.6rem}
 # ================== SECRETS / SHEETS ==================
 SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
 GCP_SA = st.secrets.get("gcp_service_account", {})
+
 if not SHEET_ID:
     st.error("Falta `SHEET_ID` en secrets."); st.stop()
 if not GCP_SA:
     st.error("Falta el bloque `gcp_service_account` en secrets."); st.stop()
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 try:
     credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
     gc = gspread.authorize(credentials)
 except Exception as e:
     st.error(f"No se pudo autorizar Google Sheets: {e}"); st.stop()
 
-# ================== SESIÓN HTTP para yfinance ==================
+# ================== SESIÓN HTTP para yfinance (reintentos + jitter) ==================
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
 os.environ.setdefault("YF_USER_AGENT", UA)
 
@@ -57,31 +61,32 @@ def make_yf_session():
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.8",
         "Connection": "keep-alive",
     })
-    # Reintentos educados ante 429/5xx
     if Retry is not None:
         retry = Retry(
-            total=4, read=4, connect=4,
-            backoff_factor=0.9,
+            total=5, connect=5, read=5,
+            backoff_factor=0.8,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=frozenset(["GET"])
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-        s.mount("https://", adapter)
-        s.mount("http://", adapter)
+        ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+        s.mount("https://", ad); s.mount("http://", ad)
+    # atributo informal que yfinance lee para timeout
+    s.timeout = 30
     return s
 
 YF_SESSION = make_yf_session()
 
+def _sleep_backoff(k: int):
+    # backoff exponencial + jitter (evita sincronizar el rate-limit)
+    time.sleep((0.8 + 0.4*random.random()) * (k + 1))
+
 # ================== CACHES ==================
 def refresh_all():
-    for f in (
-        read_sheet, load_all_data,
-        fetch_prices_yf, last_prices_yf
-    ):
+    for f in (read_sheet, load_all_data, fetch_prices_yf, last_prices_yf):
         try: f.clear()
         except Exception: pass
     try: st.cache_data.clear()
@@ -128,13 +133,10 @@ def _clean_tickers(tickers):
         if t2 and t2 not in uniq: uniq.append(t2)
     return uniq
 
-# ================== yfinance (principal) con sesión + tolerancia ==================
+# ================== yfinance – HISTÓRICO (Ticker.history ➜ download ➜ periodo corto) ==================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
-                     pause_sec=1.2, retries=3, years=10):
-    """
-    Descarga secuencial con sesión propia y reintentos.
-    """
+                     retries=4, years=10):
     tickers = _clean_tickers(tickers)
     if not tickers:
         return pd.DataFrame(), [], []
@@ -143,28 +145,50 @@ def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
     for t in tickers:
         got = pd.DataFrame()
         for k in range(retries):
+            # RUTA 1: Ticker.history
             try:
-                if start is None and end is None:
-                    d = yf.download(
-                        t, period=f"{years}y", interval=interval,
-                        auto_adjust=True, progress=False, threads=False,
-                        session=YF_SESSION
-                    )
-                else:
-                    d = yf.download(
-                        t, start=start, end=end, interval=interval,
-                        auto_adjust=True, progress=False, threads=False,
-                        session=YF_SESSION
-                    )
-                if d is not None and not d.empty and "Close" in d.columns:
-                    s = d["Close"].dropna()
-                    if not s.empty:
-                        frames.append(s.rename(t).to_frame())
-                        got = frames[-1]; break
+                hist = yf.Ticker(t, session=YF_SESSION).history(
+                    period=f"{years}y" if start is None else None,
+                    start=None if start is None else start,
+                    end=end, interval=interval, auto_adjust=True
+                )
+                if hist is not None and not hist.empty and "Close" in hist.columns:
+                    s = hist["Close"].dropna().rename(t)
+                    frames.append(s.to_frame()); got = frames[-1]; break
             except Exception as e:
-                # Guardamos traza pero seguimos intentando
-                errs.append(f"[yf:{t}] {type(e).__name__}: {e}")
-            time.sleep(pause_sec * (k + 1))
+                errs.append(f"[yf-hist:{t}] {type(e).__name__}: {e}")
+
+            # RUTA 2: download
+            try:
+                dl = yf.download(
+                    t,
+                    period=f"{years}y" if start is None else None,
+                    start=None if start is None else start,
+                    end=end,
+                    interval=interval,
+                    auto_adjust=True,
+                    progress=False, threads=False, session=YF_SESSION
+                )
+                if dl is not None and not dl.empty and "Close" in dl.columns:
+                    s = dl["Close"].dropna().rename(t)
+                    frames.append(s.to_frame()); got = frames[-1]; break
+            except Exception as e:
+                errs.append(f"[yf-dl:{t}] {type(e).__name__}: {e}")
+
+            # RUTA 3: periodo corto por si el largo cae
+            try:
+                dl2 = yf.download(
+                    t, period="1y", interval=interval, auto_adjust=True,
+                    progress=False, threads=False, session=YF_SESSION
+                )
+                if dl2 is not None and not dl2.empty and "Close" in dl2.columns:
+                    s = dl2["Close"].dropna().rename(t)
+                    frames.append(s.to_frame()); got = frames[-1]; break
+            except Exception as e:
+                errs.append(f"[yf-short:{t}] {type(e).__name__}: {e}")
+
+            _sleep_backoff(k)
+
         if got.empty:
             failed.append(t)
 
@@ -173,26 +197,38 @@ def fetch_prices_yf(tickers, start=None, end=None, interval="1d",
         return df, list(sorted(set(failed))), list(dict.fromkeys(errs))
     return pd.DataFrame(), tickers, list(dict.fromkeys(errs))
 
+# ================== yfinance – ÚLTIMO PRECIO (history ➜ download ➜ 1h) ==================
 @st.cache_data(ttl=1800, show_spinner=False)
 def last_prices_yf(tickers):
     tickers = _clean_tickers(tickers)
     out, failed, errs = {}, [], []
     for t in tickers:
         ok = False
-        for k in range(4):
+        for k in range(5):
             try:
-                d = yf.download(
-                    t, period="15d", interval="1d",
-                    auto_adjust=True, progress=False, threads=False,
-                    session=YF_SESSION
-                )
-                if d is not None and not d.empty and "Close" in d.columns:
-                    s = d["Close"].dropna().ffill()
-                    if not s.empty:
-                        out[t] = float(s.iloc[-1]); ok = True; break
+                h = yf.Ticker(t, session=YF_SESSION).history(period="15d", interval="1d", auto_adjust=True)
+                if h is not None and not h.empty and "Close" in h.columns:
+                    out[t] = float(h["Close"].dropna().iloc[-1]); ok = True; break
             except Exception as e:
-                errs.append(f"[yf-last:{t}] {type(e).__name__}: {e}")
-            time.sleep(1.2 * (k + 1))
+                errs.append(f"[yf-last-hist:{t}] {type(e).__name__}: {e}")
+
+            try:
+                d = yf.download(t, period="10d", interval="1d", auto_adjust=True,
+                                progress=False, threads=False, session=YF_SESSION)
+                if d is not None and not d.empty and "Close" in d.columns:
+                    out[t] = float(d["Close"].dropna().iloc[-1]); ok = True; break
+            except Exception as e:
+                errs.append(f"[yf-last-dl:{t}] {type(e).__name__}: {e}")
+
+            try:
+                d2 = yf.download(t, period="5d", interval="1h", auto_adjust=True,
+                                 progress=False, threads=False, session=YF_SESSION)
+                if d2 is not None and not d2.empty and "Close" in d2.columns:
+                    out[t] = float(d2["Close"].dropna().iloc[-1]); ok = True; break
+            except Exception as e:
+                errs.append(f"[yf-last-1h:{t}] {type(e).__name__}: {e}")
+
+            _sleep_backoff(k)
         if not ok:
             failed.append(t)
     return out, failed
@@ -314,7 +350,6 @@ rf = get_setting(settings_df,"RF",0.03,float)
 benchmark = get_setting(settings_df,"Benchmark","SPY",str)
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
-use_direct_yahoo = bool(get_setting(settings_df,"UseDirectYahoo",0,float))  # lo dejamos para futuro
 
 # ================== SIDEBAR ==================
 st.sidebar.title("📊 Navegación")
@@ -324,7 +359,7 @@ period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
 def load_prices_with_fallback(tickers, bench, start_date):
-    # ÚNICAMENTE yfinance (evitamos JSONDecode del directo)
+    # Solo yfinance (3 rutas); sin librerías extra
     prices, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
     bench_ret = pd.Series(dtype=float)
     if not prices.empty and bench in prices.columns:
@@ -474,7 +509,7 @@ elif page=="Evaluar Candidato":
         st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    last_map, fail_lp = last_prices_yf([tkr])  # yfinance con sesión
+    last_map, fail_lp = last_prices_yf([tkr])
     last = last_map.get(tkr, np.nan)
     if np.isnan(last): st.warning("Ticker inválido o sin último precio (Yahoo)."); st.stop()
 
@@ -539,7 +574,16 @@ elif page=="Diagnóstico":
         st.dataframe(load_all_data()[1], use_container_width=True)
 
     with col2:
-        st.subheader("Ping yfinance (SPY 30d)")
+        st.subheader("Ping yfinance / Yahoo")
+        # Test directo a un endpoint de Yahoo para ver si hay bloqueo de red
+        try:
+            r = YF_SESSION.get("https://query1.finance.yahoo.com/v7/finance/options/SPY", timeout=10)
+            st.write(f"GET options/SPY → {r.status_code}")
+            st.code((r.text or "")[:240])
+        except Exception as e:
+            st.error(f"Request directa falló: {e}")
+
+        st.subheader("Descarga de prueba (SPY 30d)")
         try:
             test = yf.download("SPY", period="30d", interval="1d", auto_adjust=True,
                                progress=False, threads=False, session=YF_SESSION)
