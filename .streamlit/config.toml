@@ -1,11 +1,6 @@
 [theme]
 base="dark"
-primaryColor="#7c5cff"
-backgroundColor="#0f1116"
-secondaryBackgroundColor="#171923"
-textColor="#e6e6e6"
-font="sans serif"
-
-[client]
-toolbarMode="viewer"
-showErrorDetails=false
+primaryColor="#7c6cff"
+backgroundColor="#0b0f1a"
+secondaryBackgroundColor="#141927"
+textColor="#ffffff"
