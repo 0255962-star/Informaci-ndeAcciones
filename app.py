@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio Activo (Yahoo sólo con yfinance secuencial + directo como backup)
+# APP Finanzas – Portafolio Activo (yfinance secuencial + fallback directo opcional)
 from datetime import datetime, timedelta, timezone
 import os, time
 import numpy as np
@@ -145,6 +145,11 @@ def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
         for k in range(3):
             try:
                 r = requests.get(url, headers=headers, params=params, timeout=timeout)
+                # >>> Cambio: sólo parseamos JSON si el servidor realmente envía JSON
+                ctype = r.headers.get("Content-Type","").lower()
+                if "application/json" not in ctype:
+                    last_err = f"{url} -> non-JSON ({ctype}) HTTP {r.status_code}"
+                    time.sleep(0.7*(k+1)); continue
                 if r.status_code != 200:
                     last_err = f"{url} -> HTTP {r.status_code}"
                     time.sleep(0.7*(k+1)); continue
@@ -374,9 +379,11 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # usa SPY por defecto (más robusto)
+benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # SPY por defecto
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
+# >>> Cambio: bandera para activar/desactivar fallback directo
+use_direct_yahoo = bool(get_setting(settings_df,"UseDirectYahoo",0,float))
 
 # ================== SIDEBAR ==================
 st.sidebar.title("📊 Navegación")
@@ -385,7 +392,7 @@ window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"],
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
-# ================== FUNCIÓN CARGA PRECIOS ROBUSTA ==================
+# ================== CARGA PRECIOS CON CONTROL DE FALLBACK ==================
 def load_prices_with_fallback(tickers, bench, start_date):
     # 1) yfinance secuencial (principal)
     prices, failed_yf, errs_yf = fetch_prices_yf(tickers + [bench], start=start_date)
@@ -395,20 +402,20 @@ def load_prices_with_fallback(tickers, bench, start_date):
         bench_ret = prices[[bench]].pct_change().dropna()[bench]
         prices = prices.drop(columns=[bench], errors="ignore")
 
-    # 2) si vacío, intento directo
-    if prices.empty:
+    failed_all = failed_yf or []
+    errs_all = errs_yf or []
+
+    # 2) DIRECTO SÓLO si está habilitado en Settings
+    if prices.empty and use_direct_yahoo:
         prices2, failed_d, errs_d = fetch_prices_yahoo_direct(tickers + [bench], start=start_date)
         if not prices2.empty and bench in prices2.columns:
             bench_ret = prices2[[bench]].pct_change().dropna()[bench]
             prices2 = prices2.drop(columns=[bench], errors="ignore")
         prices = prices2
         failed_all = failed_d
-        errs_all = errs_yf + errs_d
-    else:
-        failed_all = failed_yf
-        errs_all = errs_yf
+        errs_all = errs_all + (errs_d or [])
 
-    # 3) benchmark alterno si aún vacío
+    # 3) Benchmark alterno si aún vacío
     if prices.empty:
         alt_bench = "SPY"
         if bench != alt_bench and alt_bench not in tickers:
@@ -418,8 +425,8 @@ def load_prices_with_fallback(tickers, bench, start_date):
                     bench_ret = tmp[[alt_bench]].pct_change().dropna()[alt_bench]
                     tmp = tmp.drop(columns=[alt_bench], errors="ignore")
                 prices = tmp
-                failed_all = list(set((failed_all or []) + fb))
-                errs_all = (errs_all or []) + fe
+                failed_all = list(set((failed_all or []) + (fb or [])))
+                errs_all = errs_all + (fe or [])
 
     return prices, bench_ret, (failed_all or []), (errs_all or [])
 
@@ -530,8 +537,6 @@ elif page=="Optimizar y Rebalancear":
         st.warning("No hay retornos suficientes para optimizar."); st.stop()
 
     mean_daily=asset_rets.mean(); cov=asset_rets.cov(); mu_ann=(1+mean_daily)**252-1
-    w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
-    w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
     bounds=[(w_min,w_max)]*len(tickers)
     w_opt = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
     w_opt = pd.Series(w_opt, index=tickers).clip(lower=w_min, upper=w_max); w_opt/=w_opt.sum()
@@ -567,7 +572,7 @@ elif page=="Evaluar Candidato":
         st.stop()
 
     w_cur = weights_from_positions(pos_df)
-    last_map, fail_lp = last_prices_yf([tkr])  # usa yfinance primero para último precio
+    last_map, fail_lp = last_prices_yf([tkr])  # yfinance primero
     if fail_lp:
         last_map2, _ = last_prices_direct(fail_lp)
         last_map.update(last_map2)
