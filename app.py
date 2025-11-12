@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio Activo (botón eliminar en la tabla)
+# APP Finanzas – Portafolio Activo (botón eliminar en la tabla, fixes)
 from datetime import datetime, timedelta, timezone
 import os, time
 import numpy as np
@@ -236,7 +236,7 @@ def last_prices_yf(tickers):
             try:
                 d = yf.download(t, period="15d", interval="1d",
                                 auto_adjust=True, progress=False, threads=False)
-                if d is not None and not empty and "Close" in d.columns:
+                if d is not None and not d.empty and "Close" in d.columns:  # <-- fix
                     s = d["Close"].dropna().ffill()
                     if not s.empty:
                         out[t] = float(s.iloc[-1]); ok = True; break
@@ -351,7 +351,7 @@ def const_weight_returns(price_df:pd.DataFrame, weights:pd.Series):
 
 # ================== OPTIMIZACIÓN ==================
 def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
-    n=len(mean_ret); 
+    n=len(mean_ret)
     if n==0: return np.array([])
     if bounds is None: bounds=[(0.0,1.0)]*n
     def neg_sharpe(w):
@@ -386,7 +386,7 @@ def delete_transactions_by_ticker(ticker:str)->int:
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","SPY",str)
+benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # SPY por defecto
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
 
@@ -448,6 +448,7 @@ if page=="Mi Portafolio":
         st.stop()
 
     w = weights_from_positions(pos_df)
+    asset_rets = prices.pct_change().dropna(how="all")
     since_buy = (pos_df.set_index("Ticker")["MarketPrice"]/pos_df.set_index("Ticker")["AvgCost"] - 1).replace([np.inf,-np.inf], np.nan)
     window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df["Ticker"]).fillna(np.nan)
     pos_df = pos_df.set_index("Ticker").loc[w.index].reset_index()
@@ -472,31 +473,36 @@ if page=="Mi Portafolio":
         if pd.isna(val): return "color: inherit;"
         return "color: #18b26b;" if val>=0 else "color: #ff4d4f;"
 
+    # Formateo visual (no editable) lo seguimos usando para colores
+    styled = (view.style
+        .format({**money_fmt, **pct_fmt}, na_rep="—")
+        .applymap(color_pct, subset=["P/L % (compra)","Δ % ventana"])
+        .set_properties(subset=["Ticker","Shares"], **{"font-weight":"600"})
+    )
+
+    # Data editor con botón pequeño rojo
     colcfg = {
-        "Eliminar": st.column_config.Button(
+        "Eliminar": st.column_config.ButtonColumn(
             label="", help="Eliminar este ticker",
-            icon=":material/remove_circle:",  # ícono de “menos” en rojo
+            icon=":material/remove_circle:",   # círculo con signo menos (rojo por tema)
             width="small"
         )
     }
 
-    # mostramos el editor con botón por fila (todos los demás campos deshabilitados)
+    # mostramos el editor; deshabilitamos el resto de columnas
     editor = st.data_editor(
         view, hide_index=True, use_container_width=True,
         column_config=colcfg,
         disabled=[c for c in view.columns if c!="Eliminar"],
         key="positions_table"
-    ).copy()
+    )
 
-    # ¿Se presionó algún botón?
-    # Streamlit expone los clics en session_state[f"{key}_button_clicked"] con info de fila/columna.
-    clicks = st.session_state.get("positions_table", {}).get("button_clicked", {})
-    # clicks = {"column":"Eliminar","row": <row_index>} cuando hay clic
-    if clicks and clicks.get("column") == "Eliminar":
+    # detectar clic (Streamlit guarda en "<key>_button_clicked")
+    clicks = st.session_state.get("positions_table_button_clicked")
+    if isinstance(clicks, dict) and clicks.get("column") == "Eliminar":
         row_idx = clicks.get("row")
         if row_idx is not None and 0 <= row_idx < len(editor):
-            tkr_clicked = editor.iloc[row_idx]["Ticker"]
-            st.session_state["delete_candidate"] = str(tkr_clicked)
+            st.session_state["delete_candidate"] = str(editor.iloc[row_idx]["Ticker"])
 
     # Modal de confirmación
     if st.session_state.get("delete_candidate"):
@@ -517,9 +523,10 @@ if page=="Mi Portafolio":
                 st.session_state["delete_candidate"] = ""
                 st.info("Operación cancelada.")
 
-    # KPIs y gráficos
+    # KPIs y curva
     c_top1, c_top2 = st.columns([2,1])
     with c_top1:
+        st.subheader("Composición y rendimiento (constante)")
         port_ret, _ = const_weight_returns(prices, w)
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         c1.metric("Rend. anualizado", f"{(annualize_return(port_ret) or 0)*100:,.2f}%")
@@ -529,6 +536,7 @@ if page=="Mi Portafolio":
         c4.metric("Max Drawdown", f"{(mdd or 0)*100:,.2f}%")
         c5.metric("Sortino", f"{(sortino(port_ret, rf) or 0):.2f}")
         c6.metric("Calmar", f"{(calmar(port_ret) or 0):.2f}")
+
         curve=pd.DataFrame({"Portafolio":(1+port_ret).cumprod()})
         if not bench_ret.empty:
             curve["Benchmark"]=(1+bench_ret).cumprod().reindex(curve.index).ffill()
@@ -543,8 +551,10 @@ elif page=="Optimizar y Rebalancear":
     st.title("🛠️ Optimizar y Rebalancear")
     pos_df = positions_from_tx(tx_df)
     if pos_df.empty: st.info("No hay posiciones."); st.stop()
+
     tickers = pos_df["Ticker"].tolist()
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
+
     if prices.empty:
         st.warning("No hay precios para optimizar (Yahoo).")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
@@ -552,41 +562,50 @@ elif page=="Optimizar y Rebalancear":
             with st.expander("Detalles de errores Yahoo"): 
                 for e in errs_all: st.code(e)
         st.stop()
+
     if failed_all:
         st.caption("⚠️ Excluidos por falta de histórico: " + ", ".join(sorted(set(failed_all))))
         good = [c for c in prices.columns if prices[c].notna().any()]
-        prices = prices[good]; pos_df = pos_df[pos_df["Ticker"].isin(good)].copy()
+        prices = prices[good]
+        pos_df = pos_df[pos_df["Ticker"].isin(good)].copy()
 
     w_cur = weights_from_positions(pos_df)
     port_ret_cur, asset_rets = const_weight_returns(prices, w_cur)
-    if asset_rets.empty: st.warning("No hay retornos suficientes para optimizar."); st.stop()
-    mean_daily=asset_rets.mean(); cov=asset_rets.cov(); mu_ann=(1+mean_daily)**252-1
-    n=len(mu_ann); bounds=[(w_min,w_max)]*n
+    if asset_rets.empty:
+        st.warning("No hay retornos suficientes para optimizar."); st.stop()
+
+    mean_daily=asset_rets.mean()
+    cov=asset_rets.cov()
+    mu_ann=(1+mean_daily)**252-1
+
+    n=len(mu_ann)
+    bounds=[(w_min,w_max)]*n
     w_opt_arr = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
-    w_opt = pd.Series(w_opt_arr, index=mu_ann.index).clip(lower=w_min, upper=w_max); w_opt /= w_opt.sum()
+    w_opt = pd.Series(w_opt_arr, index=mu_ann.index).clip(lower=w_min, upper=w_max)
+    w_opt /= w_opt.sum()
+
     port_ret_opt,_ = const_weight_returns(prices, w_opt)
     c1,c2,c3,c4=st.columns(4)
     c1.metric("Sharpe actual", f"{(sharpe(port_ret_cur, rf) or 0):.2f}")
     c2.metric("Sharpe propuesto", f"{(sharpe(port_ret_opt, rf) or 0):.2f}")
     c3.metric("Vol. actual", f"{(annualize_vol(port_ret_cur) or 0)*100:,.2f}%")
     c4.metric("Vol. propuesto", f"{(annualize_vol(port_ret_opt, rf) or 0)*100:,.2f}%")
+
     compare=pd.DataFrame({"Weight Actual":w_cur,"Weight Propuesto":w_opt}).fillna(0)
     compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
-    st.data_editor(compare, hide_index=False, use_container_width=True,
-                   column_config={"Weight Actual":st.column_config.NumberColumn(format="%.2f%%"),
-                                  "Weight Propuesto":st.column_config.NumberColumn(format="%.2f%%"),
-                                  "Δ (pp)":st.column_config.NumberColumn(format="%.2f")},
-                   disabled=list(compare.columns))
+    st.dataframe(compare.style.format({"Weight Actual":"{:,.2%}","Weight Propuesto":"{:,.2%}","Δ (pp)":"{:,.2f}"}), use_container_width=True)
 
 # ================== EVALUAR CANDIDATO ==================
 elif page=="Evaluar Candidato":
     st.title("🧪 Evaluar Candidato")
     pos_df = positions_from_tx(tx_df)
     if pos_df.empty: st.info("Sin posiciones."); st.stop()
+
     tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
     if not tkr: st.stop()
     tickers = sorted(set(pos_df["Ticker"].tolist()+[tkr]))
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
+
     if prices.empty:
         st.warning("No se pudieron descargar precios desde Yahoo.")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
@@ -594,12 +613,15 @@ elif page=="Evaluar Candidato":
             with st.expander("Detalles de errores Yahoo"):
                 for e in errs_all: st.code(e)
         st.stop()
+
     w_cur = weights_from_positions(pos_df)
     last_map, fail_lp = last_prices_yf([tkr])
     if fail_lp:
-        last_map2, _ = last_prices_direct(fail_lp); last_map.update(last_map2)
+        last_map2, _ = last_prices_direct(fail_lp)
+        last_map.update(last_map2)
     last = last_map.get(tkr, np.nan)
     if np.isnan(last): st.warning("Ticker inválido o sin último precio (Yahoo)."); st.stop()
+
     mode = st.radio("Forma de evaluación", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
     if mode=="Asignar porcentaje":
         pct=st.slider("Peso objetivo del candidato",0.0,0.40,0.10,0.01)
@@ -608,6 +630,7 @@ elif page=="Evaluar Candidato":
         qty=st.number_input("Acciones a comprar (simulado)",min_value=1,value=5,step=1)
         pv=pos_df["MarketValue"].sum(); add=qty*last; base=pv+add if (pv+add)>0 else 1.0
         w_new=(w_cur*pv)/base; w_new=w_new.reindex(prices.columns).fillna(0.0); w_new[tkr]+=add/base
+
     port_cur,_=const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
     port_new,_=const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
     c=st.columns(4)
@@ -655,8 +678,10 @@ elif page=="Diagnóstico":
             st.success("Hojas encontradas:"); st.write(titles)
         except Exception as e:
             st.error(f"No pude listar hojas: {e}")
+
         st.subheader("Settings")
         st.dataframe(load_all_data()[1], use_container_width=True)
+
     with col2:
         st.subheader("Ping yfinance (SPY 30d)")
         try:
@@ -669,6 +694,7 @@ elif page=="Diagnóstico":
                 st.dataframe(test.tail(5))
         except Exception as e:
             st.error(f"Error yfinance: {e}")
+
         st.subheader("Ping Yahoo directo (MSFT 30d)")
         try:
             s, err = _direct_one("MSFT", interval="1d")
@@ -680,5 +706,7 @@ elif page=="Diagnóstico":
                 if err: st.code(err)
         except Exception as e:
             st.error(f"Error directo: {e}")
+
     st.subheader("Transactions (muestra)")
     st.dataframe(load_all_data()[0].head(10), use_container_width=True)
+
