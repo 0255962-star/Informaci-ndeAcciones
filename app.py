@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio con cache en Google Sheets (PricesCache)
+# APP Finanzas – Portafolio con cache incremental + backfill en Google Sheets
 from datetime import datetime, timedelta, timezone
 import os, time, logging
 import numpy as np
@@ -59,7 +59,7 @@ def refresh_all():
     for f in (
         read_sheet, load_all_data, fetch_prices_yahoo_direct,
         fetch_prices_yf_batch, last_prices_direct, last_prices_yf_safe,
-        cache_read_prices, cache_latest_date_per_ticker
+        cache_read_prices, cache_latest_date_per_ticker, cache_earliest_date_per_ticker
     ):
         try: f.clear()
         except Exception: pass
@@ -140,13 +140,13 @@ def cache_read_prices(tickers, start_date=None):
     df = df[(df["Date"]!="") & (df["Ticker"]!="") & (df["Close"]!="")]
     if df.empty: 
         return pd.DataFrame()
-    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
     df["Close"]  = pd.to_numeric(df["Close"], errors="coerce")
     df = df.dropna(subset=["Date","Ticker","Close"])
 
     if start_date:
-        df = df[df["Date"] >= pd.to_datetime(start_date)]
+        df = df[df["Date"] >= pd.to_datetime(start_date).normalize()]
 
     if tickers:
         tset = {t.upper().strip().replace(" ","") for t in tickers}
@@ -155,7 +155,11 @@ def cache_read_prices(tickers, start_date=None):
     if df.empty:
         return pd.DataFrame()
 
-    wide = df.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last").sort_index()
+    wide = (
+        df.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
+          .sort_index()
+    )
+    wide = wide[~wide.index.duplicated(keep="last")]
     return wide
 
 @st.cache_data(ttl=0, show_spinner=False)
@@ -172,13 +176,36 @@ def cache_latest_date_per_ticker(tickers):
     df = df[(df["Date"]!="") & (df["Ticker"]!="")]
     if df.empty: 
         return out
-    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
     df = df.dropna(subset=["Date","Ticker"])
     for t in tickers:
         t2 = t.upper().strip().replace(" ","")
         sub = df.loc[df["Ticker"]==t2, "Date"]
         out[t] = sub.max() if not sub.empty else None
+    return out
+
+@st.cache_data(ttl=0, show_spinner=False)
+def cache_earliest_date_per_ticker(tickers):
+    """Regresa dict {ticker: primera_fecha_en_cache} (o None si no hay)."""
+    ws = _get_cache_ws()
+    values = ws.get_all_values()
+    out = {t: None for t in tickers}
+    if not values or len(values) < 2:
+        return out
+    df = pd.DataFrame(values[1:], columns=values[0])
+    if df.empty: 
+        return out
+    df = df[(df["Date"]!="") & (df["Ticker"]!="")]
+    if df.empty: 
+        return out
+    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
+    df = df.dropna(subset=["Date","Ticker"])
+    for t in tickers:
+        t2 = t.upper().strip().replace(" ","")
+        sub = df.loc[df["Ticker"]==t2, "Date"]
+        out[t] = sub.min() if not sub.empty else None
     return out
 
 def cache_append_prices(df_wide):
@@ -189,6 +216,10 @@ def cache_append_prices(df_wide):
     if df_wide is None or df_wide.empty:
         return 0
     ws = _get_cache_ws()
+
+    # normaliza index
+    df_wide = df_wide.copy()
+    df_wide.index = pd.to_datetime(df_wide.index).normalize()
 
     # Leemos cache existente para deduplicar
     existing = cache_read_prices(list(df_wide.columns))
@@ -220,7 +251,7 @@ def cache_append_prices(df_wide):
 
 def fetch_from_yf_missing(tickers, start_map, end_date=None):
     """
-    Descarga de yfinance SOLO lo faltante por ticker.
+    Descarga de yfinance SOLO lo faltante hacia adelante por ticker.
     start_map: dict {ticker: fecha_inicio} (si None -> 10 años).
     end_date: str 'YYYY-MM-DD' o None.
     Devuelve DF wide de Close.
@@ -250,16 +281,48 @@ def fetch_from_yf_missing(tickers, start_map, end_date=None):
             if not s.empty:
                 s_start = start_map.get(t)
                 if s_start is not None:
-                    start_dt = pd.to_datetime(s_start) + pd.Timedelta(days=1)
-                    s = s[s.index.normalize() >= start_dt.normalize()]
+                    start_dt = pd.to_datetime(s_start).normalize() + pd.Timedelta(days=1)
+                    s = s[s.index.normalize() >= start_dt]
                 frames.append(s.to_frame())
         except Exception:
             continue
     if frames:
-        return pd.concat(frames, axis=1).sort_index()
+        out = pd.concat(frames, axis=1).sort_index()
+        out.index = pd.to_datetime(out.index).normalize()
+        return out
     return pd.DataFrame()
 
-# ================== YAHOO DIRECTO (fallback adicional) ==================
+def fetch_backfill_yf(tickers, start_date, end_date):
+    """
+    Descarga histórico HACIA ATRÁS cuando start_date < primera fecha en cache.
+    """
+    if start_date is None or end_date is None:
+        return pd.DataFrame()
+    tickers_clean = [t.upper().strip().replace(" ","") for t in tickers]
+    try:
+        d = yf.download(" ".join(tickers_clean),
+                        start=start_date, end=end_date, interval="1d",
+                        auto_adjust=True, progress=False, group_by="ticker", threads=False)
+    except Exception:
+        return pd.DataFrame()
+    if d is None or d.empty:
+        return pd.DataFrame()
+    frames=[]
+    for t in tickers_clean:
+        try:
+            sub = d[(t,"Close")] if isinstance(d.columns, pd.MultiIndex) else d["Close"]
+            s = pd.Series(sub).dropna().rename(t)
+            if not s.empty:
+                frames.append(s.to_frame())
+        except Exception:
+            continue
+    if frames:
+        out = pd.concat(frames, axis=1).sort_index()
+        out.index = pd.to_datetime(out.index).normalize()
+        return out
+    return pd.DataFrame()
+
+# ================== YAHOO DIRECTO (fallback) ==================
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 os.environ.setdefault("YF_USER_AGENT", UA)
@@ -272,7 +335,7 @@ def _parse_chart_json(js) -> pd.Series:
     r = result[0]
     ts = r.get("timestamp", [])
     if not ts: return pd.Series(dtype=float)
-    idx = pd.to_datetime(pd.Series(ts), unit="s", utc=True).dt.tz_convert(None)
+    idx = pd.to_datetime(pd.Series(ts), unit="s", utc=True).dt.tz_convert(None).normalize()
     try:
         adj = r.get("indicators", {}).get("adjclose", [])
         if adj and "adjclose" in adj[0]:
@@ -329,10 +392,12 @@ def fetch_prices_yahoo_direct(tickers, start=None, end=None, interval="1d"):
             failed.append(t); 
             if err: errs.append(f"[direct:{t}] {err}")
     if frames:
-        return pd.concat(frames, axis=1).sort_index(), failed, errs
+        df = pd.concat(frames, axis=1).sort_index()
+        df.index = pd.to_datetime(df.index).normalize()
+        return df, failed, errs
     return pd.DataFrame(), tickers, errs
 
-# ================== yfinance BATCH (solo para últimos precios) ==================
+# ================== yfinance BATCH (solo últimos precios) ==================
 @st.cache_data(ttl=1800, show_spinner=False)
 def last_prices_yf_safe(tickers):
     tickers = _clean_tickers(tickers)
@@ -513,66 +578,72 @@ window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"],
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
-# ================== CARGA DE PRECIOS (cache primero, luego faltantes) ==================
+# ================== CARGA DE PRECIOS (cache + backfill + forward-fill) ==================
 def load_prices_with_fallback(tickers, bench, start_date):
     """
     1) Lee cache (PricesCache) para tickers + benchmark.
-    2) Calcula qué falta por ticker y descarga SOLO lo faltante.
-    3) Anexa al cache y vuelve a leer consolidado.
-    4) Devuelve (prices_sin_benchmark, benchmark_returns, failed, errs)
+    2) Si ventana pedida (start_date) < primera fecha en cache -> BACKFILL.
+    3) Si falta desde última fecha hasta hoy -> FORWARD-INCREMENTAL.
+    4) Devuelve (prices_sin_benchmark, benchmark_returns, failed, errs).
     """
     all_tickers = list(dict.fromkeys((tickers or []) + [bench]))
 
     # 1) leer cache existente
     cached = cache_read_prices(all_tickers, start_date=start_date)
 
-    # 2) calcular faltantes por ticker
-    latest = cache_latest_date_per_ticker(all_tickers)
-    start_map = {}
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    for t in all_tickers:
-        last_dt = latest.get(t)
-        if last_dt is None:
-            start_map[t] = start_date  # None -> 10y
-        else:
-            if start_date and pd.to_datetime(start_date) > pd.to_datetime(last_dt):
-                start_map[t] = start_date
-            else:
-                start_map[t] = last_dt.strftime("%Y-%m-%d")
+    # Mapa earliest/latest por ticker
+    earliest = cache_earliest_date_per_ticker(all_tickers)
+    latest   = cache_latest_date_per_ticker(all_tickers)
 
-    # ¿hay algo que bajar?
+    # -------- BACKFILL (si la ventana pide fechas más antiguas que earliest) --------
+    need_back = []
+    back_start_map = {}
+    if start_date is not None:
+        sdt = pd.to_datetime(start_date).normalize()
+        for t in all_tickers:
+            e0 = earliest.get(t)
+            if e0 is None or (not pd.isna(e0) and sdt < e0):
+                need_back.append(t)
+                # si no hay earliest, pedimos 10 años hacia atrás desde sdt
+                back_start_map[t] = start_date
+        if need_back:
+            end_map = {}
+            for t in need_back:
+                e0 = earliest.get(t)
+                if e0 is None:
+                    # bajamos desde start_date hasta hoy (luego forward acota)
+                    end_map[t] = datetime.utcnow().strftime("%Y-%m-%d")
+                else:
+                    end_map[t] = (pd.to_datetime(e0) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            back_df = fetch_backfill_yf(need_back, start_date, min(end_map.values()))
+            if back_df is not None and not back_df.empty:
+                cache_append_prices(back_df)
+
+    # -------- FORWARD (si falta desde la última fecha en cache hasta hoy) --------
+    today = pd.Timestamp(datetime.utcnow().date())
     needs = []
+    start_map = {}
     for t in all_tickers:
         ld = latest.get(t)
-        if ld is None or pd.Timestamp(ld).normalize() < pd.Timestamp(today).normalize():
+        if ld is None or pd.Timestamp(ld).normalize() < today:
             needs.append(t)
-
-    errs_all = []
+            start_map[t] = start_date if ld is None else pd.to_datetime(ld).strftime("%Y-%m-%d")
     if needs:
         missing_df = fetch_from_yf_missing(needs, start_map, end_date=None)
-        if missing_df is None:
-            missing_df = pd.DataFrame()
-        if not missing_df.empty:
-            try:
-                cache_append_prices(missing_df)
-            except Exception as e:
-                errs_all.append(f"[cache_append] {type(e).__name__}: {e}")
+        if missing_df is not None and not missing_df.empty:
+            cache_append_prices(missing_df)
 
-    # 4) consolidado del cache
+    # 4) consolidado del cache (ya actualizado)
     consolidated = cache_read_prices(all_tickers, start_date=start_date)
 
     # Fallback directo si aún no hay nada
-    failed_all = []
+    failed_all = []; errs_all = []
     if consolidated is None or consolidated.empty:
         from_direct, failed_d, errs_d = fetch_prices_yahoo_direct(all_tickers, start=start_date, end=None)
         if not from_direct.empty:
-            try:
-                cache_append_prices(from_direct)
-            except Exception as e:
-                errs_all.append(f"[cache_append_direct] {type(e).__name__}: {e}")
+            cache_append_prices(from_direct)
             consolidated = from_direct
-        failed_all = failed_d
-        errs_all += errs_d
+        failed_all = failed_d; errs_all += errs_d
 
     bench_ret = pd.Series(dtype=float)
     prices = consolidated.copy()
@@ -598,7 +669,13 @@ if page=="Mi Portafolio":
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
         st.stop()
 
+    # Salvaguarda: si hay menos de 2 días, avisamos (evita métricas y gráfico planos)
+    if prices.shape[0] < 2:
+        st.info("Necesito al menos 2 días de histórico para calcular métricas. Se está completando el cache; vuelve a intentarlo en segundos.")
+        # seguimos mostrando la tabla de posiciones:
     w = weights_from_positions(pos_df)
+
+    # Cálculos de tabla
     since_buy = (pos_df.set_index("Ticker")["MarketPrice"]/pos_df.set_index("Ticker")["AvgCost"] - 1).replace([np.inf,-np.inf], np.nan)
     window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df["Ticker"]).fillna(np.nan)
     pos_df = pos_df.set_index("Ticker").loc[w.index].reset_index()
@@ -663,26 +740,26 @@ if page=="Mi Portafolio":
                 st.session_state["prev_editor_df"]["➖"] = False
                 st.info("Operación cancelada.")
 
-    # KPIs y gráfico
-    c_top1, c_top2 = st.columns([2,1])
-    with c_top1:
-        port_ret, _ = const_weight_returns(prices, w)
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("Rend. anualizado", f"{(annualize_return(port_ret) or 0)*100:,.2f}%")
-        c2.metric("Vol. anualizada", f"{(annualize_vol(port_ret) or 0)*100:,.2f}%")
-        c3.metric("Sharpe", f"{(sharpe(port_ret, rf) or 0):.2f}")
-        cum=(1+port_ret).cumprod(); mdd=max_drawdown(cum)
-        c4.metric("Max Drawdown", f"{(mdd or 0)*100:,.2f}%")
-        c5.metric("Sortino", f"{(sortino(port_ret, rf) or 0):.2f}")
-        c6.metric("Calmar", f"{(calmar(port_ret) or 0):.2f}")
-        curve=pd.DataFrame({"Portafolio":(1+port_ret).cumprod()})
-        if not bench_ret.empty:
-            curve["Benchmark"]=(1+bench_ret).cumprod().reindex(curve.index).ffill()
-        st.plotly_chart(px.line(curve, title="Crecimiento de 1.0"), use_container_width=True)
-
-    with c_top2:
-        alloc = pd.DataFrame({"Ticker":w.index,"Weight":w.values})
-        st.plotly_chart(px.pie(alloc, names="Ticker", values="Weight", title="Asignación"), use_container_width=True)
+    # ---- KPIs y gráfico (solo si hay ≥ 2 días) ----
+    if prices.shape[0] >= 2:
+        c_top1, c_top2 = st.columns([2,1])
+        with c_top1:
+            port_ret, _ = const_weight_returns(prices, w)
+            c1,c2,c3,c4,c5,c6 = st.columns(6)
+            c1.metric("Rend. anualizado", f"{(annualize_return(port_ret) or 0)*100:,.2f}%")
+            c2.metric("Vol. anualizada", f"{(annualize_vol(port_ret) or 0)*100:,.2f}%")
+            c3.metric("Sharpe", f"{(sharpe(port_ret, rf) or 0):.2f}")
+            cum=(1+port_ret).cumprod(); mdd=max_drawdown(cum)
+            c4.metric("Max Drawdown", f"{(mdd or 0)*100:,.2f}%")
+            c5.metric("Sortino", f"{(sortino(port_ret, rf) or 0):.2f}")
+            c6.metric("Calmar", f"{(calmar(port_ret) or 0):.2f}")
+            curve=pd.DataFrame({"Portafolio":(1+port_ret).cumprod()})
+            if not bench_ret.empty:
+                curve["Benchmark"]=(1+bench_ret).cumprod().reindex(curve.index).ffill()
+            st.plotly_chart(px.line(curve, title="Crecimiento de 1.0"), use_container_width=True)
+        with c_top2:
+            alloc = pd.DataFrame({"Ticker":w.index,"Weight":w.values})
+            st.plotly_chart(px.pie(alloc, names="Ticker", values="Weight", title="Asignación"), use_container_width=True)
 
 # ================== OPTIMIZAR ==================
 elif page=="Optimizar y Rebalancear":
@@ -712,7 +789,6 @@ elif page=="Optimizar y Rebalancear":
     c2.metric("Sharpe propuesto", f"{(sharpe(port_ret_opt, rf) or 0):.2f}")
     c3.metric("Vol. actual", f"{(annualize_vol(port_ret_cur) or 0)*100:,.2f}%")
     c4.metric("Vol. propuesto", f"{(annualize_vol(port_ret_opt, rf) or 0)*100:,.2f}%")
-
     compare=pd.DataFrame({"Weight Actual":w_cur,"Weight Propuesto":w_opt}).fillna(0)
     compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
     st.data_editor(compare, hide_index=False, use_container_width=True,
