@@ -1,5 +1,7 @@
-# APP Finanzas – Portafolio con histórico en Google Sheets, autodetección de hoja/encabezados y sync incremental (FIX escritura orden de columnas)
-from datetime import datetime, timedelta, timezone
+# APP Finanzas – Portafolio con histórico en Google Sheets, autodetección de hoja/encabezados,
+# sync incremental y FIX por columnas de Fees/NetAmount como fechas
+
+from datetime import datetime, timedelta, timezone, date
 import os, time, logging, re
 import numpy as np
 import pandas as pd
@@ -62,13 +64,25 @@ def _clean_tickers(tickers):
         if t and t not in out: out.append(t)
     return out
 
+# ---- FIX datetimes en numéricos ----
+def _is_dtlike(x):
+    return isinstance(x, (pd.Timestamp, datetime, date))
+
 def _to_float(x):
+    """Convierte a float, ignorando fechas/objetos que no son números; limpia comas y símbolos."""
     if x is None or (isinstance(x,float) and np.isnan(x)): return np.nan
+    if _is_dtlike(x):  # <- fechas NO son números
+        return np.nan
     if isinstance(x,(int,float)): return float(x)
     s=str(x).strip()
+    # quitar separadores y símbolos: $ , espacios, etc.
     s=re.sub(r"[^\d\.\-]", "", s.replace(",", ""))
-    try: return float(s)
-    except: return np.nan
+    if s in ("", ".", "-", "-.", ".-"): return np.nan
+    try:
+        val=float(s)
+        return val
+    except:
+        return np.nan
 
 # ================== SHEETS R/W ==================
 @st.cache_data(ttl=600, show_spinner=False)
@@ -208,7 +222,6 @@ def cache_earliest_date_per_ticker(tickers):
 def cache_append_prices(df_wide):
     if df_wide is None or df_wide.empty: return 0
     ws, meta = _get_cache_ws()
-    # normaliza DF wide -> filas nuevas
     df_wide = df_wide.copy()
     df_wide.index = pd.to_datetime(df_wide.index).normalize()
 
@@ -222,16 +235,12 @@ def cache_append_prices(df_wide):
         to_write = mask_new.dropna(how="all")
     if to_write.empty: return 0
 
-    # >>> AQUI EL FIX DE ESCRITURA POR INDICE
-    #   1) Tomo el header real de la hoja (cualquier orden, cualquier idioma)
-    #   2) Ubico los índices de date_col / ticker_col / close_col
-    #   3) Construyo cada fila con len(header) posiciones y coloco cada valor en su índice correcto
+    # Escribir según índices reales del header (puede estar en cualquier orden/idioma)
     header_real = ws.get_all_values()[0]
     header_norm = _norm_cols(header_real)
     idx = {c:i for i,c in enumerate(header_norm)}
     dcol = meta["date_col"]; tcol = meta["ticker_col"]; ccol = meta["close_col"]
     if dcol not in idx or tcol not in idx or ccol not in idx:
-        # si por algún motivo no encuentro los nombres, recreo encabezado canónico
         ws.update("A1:C1", [["Date","Ticker","Close"]])
         header_real = ["Date","Ticker","Close"]
         header_norm = _norm_cols(header_real)
@@ -239,11 +248,11 @@ def cache_append_prices(df_wide):
         dcol, tcol, ccol = "date","ticker","close"
 
     rows=[]
-    for dt, row in to_write.sort_index().iterrows():
+    for dt_i, row in to_write.sort_index().iterrows():
         for t, val in row.items():
             if pd.isna(val): continue
             r = [""] * len(header_real)
-            r[idx[dcol]] = dt.strftime("%Y-%m-%d")
+            r[idx[dcol]] = pd.Timestamp(dt_i).strftime("%Y-%m-%d")
             r[idx[tcol]] = str(t)
             r[idx[ccol]] = float(val)
             rows.append(r)
@@ -259,7 +268,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 os.environ.setdefault("YF_USER_AGENT", UA)
 
-def _unix(dt): return int(pd.Timestamp(dt, tz=timezone.utc).timestamp())
+def _unix(dt_): return int(pd.Timestamp(dt_, tz=timezone.utc).timestamp())
 
 def _parse_chart_json(js) -> pd.Series:
     result = js.get("chart", {}).get("result", [])
@@ -365,6 +374,7 @@ def _single_yf_range(ticker, start, end):
 
 def load_prices_with_fallback(tickers, bench, start_date):
     all_t = list(dict.fromkeys((tickers or []) + [bench])); all_t = _clean_tickers(all_t)
+    # backfill si la ventana arranca antes de lo que hay guardado
     earliest = cache_earliest_date_per_ticker(all_t)
     if start_date is not None:
         sdt = pd.to_datetime(start_date).normalize()
@@ -378,6 +388,7 @@ def load_prices_with_fallback(tickers, bench, start_date):
                     if not s2.empty: cache_append_prices(s2.to_frame())
                 else:
                     cache_append_prices(s.to_frame())
+    # forward hasta hoy
     latest = cache_latest_date_per_ticker(all_t)
     today = pd.Timestamp(datetime.utcnow().date())
     for t in all_t:
@@ -444,12 +455,32 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
               "GrossAmount","NetAmount","LotID","Source","Notes"]:
         if c not in df.columns: df[c]=np.nan
+
     df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
     df=df.dropna(subset=["Ticker"])
+
     df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
-    for n in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
-        df[n]=df[n].map(_to_float)
-    df["FXRate"]=df["FXRate"].fillna(1.0)
+
+    # ---- Sanitizar Fees/Taxes/Gross/Net (pueden venir como FECHAS en tu Excel) ----
+    for col in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
+        if col in df.columns:
+            # Si la columna es datetime → convertir a NaN primero
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = np.nan
+            # Convertir a número seguro
+            df[col] = df[col].map(_to_float)
+
+    # Defaults razonables
+    if "FXRate" in df.columns:
+        df["FXRate"] = df["FXRate"].replace(0, np.nan).fillna(1.0)
+
+    # Fees/Taxes negativas o absurdas → limpiar
+    for col in ["Fees","Taxes"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+            df.loc[df[col].abs()>1e6, col] = 0.0  # anti-bomba si algo raro se cuela
+
+    # Gross/Net no los usamos para el promedio; quedan limpios por si los usas aparte
     def signed(row):
         s=str(row.get("Side","")).lower().strip()
         q=float(row.get("Shares",0) or 0)
