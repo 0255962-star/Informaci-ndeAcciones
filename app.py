@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio con histórico en Google Sheets, autodetección de hoja/encabezados y sync incremental
+# APP Finanzas – Portafolio con histórico en Google Sheets, autodetección de hoja/encabezados y sync incremental (FIX escritura orden de columnas)
 from datetime import datetime, timedelta, timezone
 import os, time, logging, re
 import numpy as np
@@ -65,9 +65,8 @@ def _clean_tickers(tickers):
 def _to_float(x):
     if x is None or (isinstance(x,float) and np.isnan(x)): return np.nan
     if isinstance(x,(int,float)): return float(x)
-    # quitar separadores y espacios no imprimibles
     s=str(x).strip()
-    s=re.sub(r"[^\d\.\-]", "", s.replace(",", ""))  # quita comas y símbolos
+    s=re.sub(r"[^\d\.\-]", "", s.replace(",", ""))
     try: return float(s)
     except: return np.nan
 
@@ -115,7 +114,6 @@ def _norm_cols(cols):
 
 @st.cache_data(ttl=0, show_spinner=False)
 def find_cache_sheet():
-    """Detecta hoja histórica y mapea columnas {date_col, ticker_col, close_col}."""
     sh = gc.open_by_key(SHEET_ID)
     candidatas = []
     for ws in sh.worksheets():
@@ -123,14 +121,12 @@ def find_cache_sheet():
         if not vals or len(vals)<1: continue
         header = _norm_cols(vals[0])
         cols = {c:i for i,c in enumerate(header)}
-        # candidatos de fecha / ticker / close (en varios idiomas)
         date_keys   = [k for k in ("date","fecha") if k in cols]
         ticker_keys = [k for k in ("ticker","symbol","simbolo") if k in cols]
         close_keys  = [k for k in ("close","cierre","adj close","adj_close","adjclose") if k in cols]
         score = int(len(date_keys)>0) + int(len(ticker_keys)>0) + int(len(close_keys)>0)
         if score >= 2:
             candidatas.append((ws.title, date_keys[:1], ticker_keys[:1], close_keys[:1]))
-    # preferencia: PricesCache si existe
     for c in candidatas:
         if c[0].strip().lower()==CACHE_CANON.lower():
             return {"sheet": c[0], "date_col": c[1][0] if c[1] else "date",
@@ -141,7 +137,6 @@ def find_cache_sheet():
         return {"sheet": c[0], "date_col": c[1][0] if c[1] else "date",
                 "ticker_col": c[2][0] if c[2] else "ticker",
                 "close_col": c[3][0] if c[3] else "close"}
-    # Si no hay ninguna, crear la canónica
     ws = sh.add_worksheet(title=CACHE_CANON, rows=1000, cols=3)
     ws.update("A1:C1", [["Date","Ticker","Close"]])
     return {"sheet": CACHE_CANON, "date_col":"date", "ticker_col":"ticker", "close_col":"close"}
@@ -213,10 +208,10 @@ def cache_earliest_date_per_ticker(tickers):
 def cache_append_prices(df_wide):
     if df_wide is None or df_wide.empty: return 0
     ws, meta = _get_cache_ws()
-    dcol = meta["date_col"]; tcol = meta["ticker_col"]; ccol = meta["close_col"]
-    # normaliza DF wide -> filas
+    # normaliza DF wide -> filas nuevas
     df_wide = df_wide.copy()
     df_wide.index = pd.to_datetime(df_wide.index).normalize()
+
     existing = cache_read_prices(list(df_wide.columns))
     to_write = df_wide.copy()
     if existing is not None and not existing.empty:
@@ -226,24 +221,37 @@ def cache_append_prices(df_wide):
             ~existing.reindex(merged.index).notna(), other=np.nan)
         to_write = mask_new.dropna(how="all")
     if to_write.empty: return 0
+
+    # >>> AQUI EL FIX DE ESCRITURA POR INDICE
+    #   1) Tomo el header real de la hoja (cualquier orden, cualquier idioma)
+    #   2) Ubico los índices de date_col / ticker_col / close_col
+    #   3) Construyo cada fila con len(header) posiciones y coloco cada valor en su índice correcto
+    header_real = ws.get_all_values()[0]
+    header_norm = _norm_cols(header_real)
+    idx = {c:i for i,c in enumerate(header_norm)}
+    dcol = meta["date_col"]; tcol = meta["ticker_col"]; ccol = meta["close_col"]
+    if dcol not in idx or tcol not in idx or ccol not in idx:
+        # si por algún motivo no encuentro los nombres, recreo encabezado canónico
+        ws.update("A1:C1", [["Date","Ticker","Close"]])
+        header_real = ["Date","Ticker","Close"]
+        header_norm = _norm_cols(header_real)
+        idx = {c:i for i,c in enumerate(header_norm)}
+        dcol, tcol, ccol = "date","ticker","close"
+
     rows=[]
     for dt, row in to_write.sort_index().iterrows():
         for t, val in row.items():
             if pd.isna(val): continue
-            rows.append([dt.strftime("%Y-%m-%d"), str(t), float(val)])
-    # mapear a columnas reales (puede que no sean A,B,C)
-    header = ws.get_all_values()[0]
-    header_norm = _norm_cols(header)
-    col_index = {c:i for i,c in enumerate(header_norm)}
-    # si los nombres no son canon, reordenamos a [dcol, tcol, ccol]
-    out_rows = []
-    for dt, tk, cl in rows:
-        rec = {dcol: dt, tcol: tk, ccol: cl}
-        out_rows.append([rec.get(dcol), rec.get(tcol), rec.get(ccol)])
+            r = [""] * len(header_real)
+            r[idx[dcol]] = dt.strftime("%Y-%m-%d")
+            r[idx[tcol]] = str(t)
+            r[idx[ccol]] = float(val)
+            rows.append(r)
+
     BATCH=800; total=0
-    for i in range(0, len(out_rows), BATCH):
-        ws.append_rows(out_rows[i:i+BATCH], value_input_option="RAW")
-        total += len(out_rows[i:i+BATCH])
+    for i in range(0, len(rows), BATCH):
+        ws.append_rows(rows[i:i+BATCH], value_input_option="RAW")
+        total += len(rows[i:i+BATCH])
     return total
 
 # ================== PRECIOS (YF/DIRECTO) ==================
@@ -357,7 +365,6 @@ def _single_yf_range(ticker, start, end):
 
 def load_prices_with_fallback(tickers, bench, start_date):
     all_t = list(dict.fromkeys((tickers or []) + [bench])); all_t = _clean_tickers(all_t)
-    # BACKFILL si la ventana arranca antes
     earliest = cache_earliest_date_per_ticker(all_t)
     if start_date is not None:
         sdt = pd.to_datetime(start_date).normalize()
@@ -371,7 +378,6 @@ def load_prices_with_fallback(tickers, bench, start_date):
                     if not s2.empty: cache_append_prices(s2.to_frame())
                 else:
                     cache_append_prices(s.to_frame())
-    # FORWARD hasta hoy
     latest = cache_latest_date_per_ticker(all_t)
     today = pd.Timestamp(datetime.utcnow().date())
     for t in all_t:
@@ -392,14 +398,12 @@ def load_prices_with_fallback(tickers, bench, start_date):
                 if not s2.empty: cache_append_prices(s2.to_frame())
             else:
                 cache_append_prices(s.to_frame())
-    # Consolidado para ventana
     consolidated = cache_read_prices(all_t, start_date=start_date)
     if consolidated is None or consolidated.empty:
         from_direct, _, _ = fetch_prices_yahoo_direct(all_t, start=start_date, end=None)
         if not from_direct.empty:
             cache_append_prices(from_direct)
             consolidated = from_direct
-    # separar bench
     bench_ret = pd.Series(dtype=float)
     prices = consolidated.copy()
     if not prices.empty and bench in prices.columns:
@@ -576,10 +580,8 @@ if page=="Mi Portafolio":
     if not tx_tickers:
         st.info("No hay posiciones. Carga operaciones en 'Transactions'."); st.stop()
 
-    # 1) sincroniza histórico (lee cache, backfill/forward por ticker, reescribe cache si hace falta)
     prices, bench_ret = load_prices_with_fallback(tx_tickers, benchmark, start_date)
 
-    # 2) construir mapa de últimos precios: primero historial de la ventana, luego cache completo
     last_hint_map = {}
     if prices is not None and not prices.empty:
         last_hint_map.update(prices.ffill().iloc[-1].dropna().astype(float).to_dict())
@@ -587,17 +589,14 @@ if page=="Mi Portafolio":
     if missing_for_last:
         last_hint_map.update(last_prices_from_cache(missing_for_last))
 
-    # 3) posiciones con ese mapa (si algo sigue faltando, YF/directo dentro de positions_from_tx)
     pos_df = positions_from_tx(tx_df, last_hint_map=last_hint_map)
     if pos_df.empty:
         st.info("No hay posiciones válidas tras procesar Transactions."); st.stop()
 
-    # msg diagnóstico si falta Last
     missing_last = pos_df.loc[pos_df["MarketPrice"].isna(),"Ticker"].tolist()
     if missing_last:
         st.caption("⚠️ Tickers sin último precio desde Sheets/YF: " + ", ".join(missing_last))
 
-    # 4) pesos y tabla
     w = weights_from_positions(pos_df)
     pos_df_view = align_positions_for_view(pos_df, w.index)
 
@@ -656,7 +655,6 @@ if page=="Mi Portafolio":
                 st.session_state[prev_key]["➖"] = False
                 st.info("Operación cancelada.")
 
-    # KPIs y charts (sin cambios de layout)
     if prices is not None and not prices.empty and prices.shape[0] >= 2 and len(w)>0:
         c_top1, c_top2 = st.columns([2,1])
         with c_top1:
