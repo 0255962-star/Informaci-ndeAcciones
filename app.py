@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio Activo (Yahoo con yfinance + fallback directo corregido)
+# APP Finanzas – Portafolio Activo (Yahoo con yfinance + fallback)
 from datetime import datetime, timedelta, timezone
 import os, time
 import numpy as np
@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import requests
 import yfinance as yf
-from scipy.optimize import minimize
+from scipy.optimize import minimize  # si no quieres SciPy, usa la versión sin SciPy que te di
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -59,6 +59,9 @@ def refresh_all():
 def read_sheet(name:str)->pd.DataFrame:
     sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
     return pd.DataFrame(ws.get_all_records())
+
+def get_worksheet(name:str):
+    sh = gc.open_by_key(SHEET_ID); return sh.worksheet(name)
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_all_data():
@@ -361,6 +364,32 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
     res=minimize(neg_sharpe,x0,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":500})
     return res.x if (hasattr(res,"success") and res.success) else x0
 
+# ======= Helpers para eliminar en Sheets =======
+def delete_transactions_by_ticker(ticker:str)->int:
+    """
+    Elimina TODAS las filas de 'Transactions' cuyo Ticker == ticker (case-insensitive).
+    Retorna cuántas filas se borraron.
+    """
+    ws = get_worksheet("Transactions")
+    values = ws.get_all_values()  # incluye encabezados
+    if not values: return 0
+    headers = values[0]
+    try:
+        tcol = headers.index("Ticker")
+    except ValueError:
+        st.error("No encontré la columna 'Ticker' en Transactions."); return 0
+
+    # filas con datos empiezan en la 2 (1-indexed)
+    to_delete = []
+    for i, row in enumerate(values[1:], start=2):
+        if len(row) > tcol and str(row[tcol]).strip().upper() == ticker.strip().upper():
+            to_delete.append(i)
+
+    # borrar de abajo hacia arriba para no desplazar índices
+    for ridx in reversed(to_delete):
+        ws.delete_rows(ridx)
+    return len(to_delete)
+
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
@@ -431,8 +460,8 @@ if page=="Mi Portafolio":
     window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df["Ticker"]).fillna(np.nan)
     pos_df = pos_df.set_index("Ticker").loc[w.index].reset_index()
 
+    # --------- TABLA (sin columna "#") + columna final de “Eliminar” (visual) ----------
     view = pd.DataFrame({
-        "#": np.arange(1, len(w)+1),
         "Ticker": pos_df["Ticker"].values,
         "Shares": pos_df["Shares"].values,
         "Avg Buy": pos_df["AvgCost"].values,
@@ -441,10 +470,10 @@ if page=="Mi Portafolio":
         "P/L % (compra)": (since_buy.reindex(pos_df["Ticker"]).values*100.0),
         "Δ % ventana": (window_change.reindex(pos_df["Ticker"]).values*100.0),
         "Peso %": (w.reindex(pos_df["Ticker"]).values*100.0),
-        "Valor": pos_df["MarketValue"].values
+        "Valor": pos_df["MarketValue"].values,
+        "🗑️ Eliminar": ["—"]*len(pos_df)  # columna visual al final
     }).replace([np.inf,-np.inf], np.nan)
 
-    # --- Formato corregido (dinero con ${:,.2f}) y NA como "—" ---
     money_fmt = {"Avg Buy":"${:,.2f}","Last":"${:,.2f}","P/L $":"${:,.2f}","Valor":"${:,.2f}"}
     pct_fmt   = {"P/L % (compra)":"{:,.2f}%","Δ % ventana":"{:,.2f}%","Peso %":"{:,.2f}%"}
     def color_pct(val):
@@ -454,7 +483,7 @@ if page=="Mi Portafolio":
     styled = (view.style
         .format({**money_fmt, **pct_fmt}, na_rep="—")
         .applymap(color_pct, subset=["P/L % (compra)","Δ % ventana"])
-        .set_properties(subset=["#","Ticker","Shares"], **{"font-weight":"600"})
+        .set_properties(subset=["Ticker","Shares"], **{"font-weight":"600"})
     )
 
     c_top1, c_top2 = st.columns([2,1])
@@ -481,7 +510,42 @@ if page=="Mi Portafolio":
 
     st.subheader("📋 Detalle de posiciones (estilo broker)")
     st.dataframe(styled, use_container_width=True, height=min(600, 120 + 32*len(view)))
-    st.download_button("⬇️ Descargar posiciones (CSV)", view.to_csv(index=False).encode("utf-8"),
+
+    # ---------- Controles de borrado (trash por fila con confirmación) ----------
+    st.markdown("#### Borrar posición del portafolio")
+    st.caption("Haz clic en el ícono de basurero de la fila (abajo) y confirma para eliminar **todas** las transacciones del ticker en *Transactions*.")
+
+    # Línea de botones (una “columna” de basureros al final)
+    for idx, row in view.iterrows():
+        colA, colB, colC = st.columns([0.8, 6, 1.2])
+        with colA:
+            st.write("")  # margen
+        with colB:
+            st.write(f"**{row['Ticker']}**  –  Valor: {money_fmt['Valor'].format(row['Valor'])}")
+        with colC:
+            if st.button("🗑️", key=f"del_{row['Ticker']}", help=f"Eliminar {row['Ticker']} de Transactions"):
+                st.session_state["delete_candidate"] = row["Ticker"]
+
+    # Modal de confirmación simple
+    if "delete_candidate" in st.session_state and st.session_state["delete_candidate"]:
+        tkr = st.session_state["delete_candidate"]
+        st.warning(f"¿Seguro que quieres eliminar **todas** las filas del ticker **{tkr}** en *Transactions*?")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ Sí, eliminar"):
+                deleted = delete_transactions_by_ticker(tkr)
+                st.session_state["delete_candidate"] = ""
+                if deleted > 0:
+                    st.success(f"Se eliminaron {deleted} fila(s) de {tkr} en Transactions.")
+                else:
+                    st.info("No se encontraron filas para eliminar.")
+                refresh_all(); st.rerun()
+        with c2:
+            if st.button("❌ No, cancelar"):
+                st.session_state["delete_candidate"] = ""
+                st.info("Operación cancelada.")
+
+    st.download_button("⬇️ Descargar posiciones (CSV)", view.drop(columns=["🗑️ Eliminar"]).to_csv(index=False).encode("utf-8"),
                        file_name="mi_portafolio.csv", mime="text/csv")
 
 # ================== OPTIMIZAR ==================
@@ -515,7 +579,6 @@ elif page=="Optimizar y Rebalancear":
     mean_daily=asset_rets.mean()
     cov=asset_rets.cov()
     mu_ann=(1+mean_daily)**252-1
-    # --- bounds del tamaño correcto (evita ValueError de SciPy) ---
     n=len(mu_ann)
     bounds=[(w_min,w_max)]*n
     w_opt_arr = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
