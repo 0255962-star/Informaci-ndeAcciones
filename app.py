@@ -199,10 +199,9 @@ def cache_append_prices(df_wide):
         ws.append_rows(chunk, value_input_option="RAW"); total += len(chunk)
     return total
 
-# ========= NUEVO: últimos precios desde el cache =========
+# ========= “Last” desde cache =========
 @st.cache_data(ttl=0, show_spinner=False)
 def last_prices_from_cache(tickers):
-    """Devuelve {ticker: ultimo_close} leyendo PricesCache; sin red."""
     tickers = _clean_tickers(tickers)
     if not tickers: return {}
     df = cache_read_prices(tickers, start_date=None)
@@ -217,7 +216,7 @@ def last_prices_from_cache(tickers):
             pass
     return out
 
-# ================== YAHOO DIRECTO / YF para históricos y últimos ==================
+# ================== YAHOO DIRECTO / YF ==================
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 os.environ.setdefault("YF_USER_AGENT", UA)
@@ -323,6 +322,115 @@ def last_prices_direct(tickers):
             failed.append(t)
     return out, failed
 
+# ================== LOAD HISTÓRICO (backfill + forward) ==================
+def fetch_from_yf_missing(tickers, start_map, end_date=None):
+    starts = [d for d in start_map.values() if d is not None]
+    if starts: min_start = min(starts)
+    else:      min_start = (datetime.utcnow() - timedelta(days=365*10)).strftime("%Y-%m-%d")
+    tickers_clean = [t.upper().strip().replace(" ","") for t in tickers]
+    try:
+        d = yf.download(" ".join(tickers_clean),
+                        start=min_start, end=end_date, interval="1d",
+                        auto_adjust=True, progress=False, group_by="ticker", threads=False)
+    except Exception:
+        return pd.DataFrame()
+    if d is None or d.empty: return pd.DataFrame()
+    frames=[]
+    for t in tickers_clean:
+        try:
+            sub = d[(t,"Close")] if isinstance(d.columns, pd.MultiIndex) else d["Close"]
+            s = pd.Series(sub).dropna().rename(t)
+            if not s.empty:
+                s_start = start_map.get(t)
+                if s_start is not None:
+                    start_dt = pd.to_datetime(s_start).normalize() + pd.Timedelta(days=1)
+                    s = s[s.index.normalize() >= start_dt]
+                frames.append(s.to_frame())
+        except Exception:
+            continue
+    if frames:
+        out = pd.concat(frames, axis=1).sort_index()
+        out.index = pd.to_datetime(out.index).normalize()
+        return out
+    return pd.DataFrame()
+
+def fetch_backfill_yf(tickers, start_date, end_date):
+    if start_date is None or end_date is None: return pd.DataFrame()
+    tickers_clean = [t.upper().strip().replace(" ","") for t in tickers]
+    try:
+        d = yf.download(" ".join(tickers_clean),
+                        start=start_date, end=end_date, interval="1d",
+                        auto_adjust=True, progress=False, group_by="ticker", threads=False)
+    except Exception:
+        return pd.DataFrame()
+    if d is None or d.empty: return pd.DataFrame()
+    frames=[]
+    for t in tickers_clean:
+        try:
+            sub = d[(t,"Close")] if isinstance(d.columns, pd.MultiIndex) else d["Close"]
+            s = pd.Series(sub).dropna().rename(t)
+            if not s.empty: frames.append(s.to_frame())
+        except Exception:
+            continue
+    if frames:
+        out = pd.concat(frames, axis=1).sort_index()
+        out.index = pd.to_datetime(out.index).normalize()
+        return out
+    return pd.DataFrame()
+
+def load_prices_with_fallback(tickers, bench, start_date):
+    all_tickers = list(dict.fromkeys((tickers or []) + [bench]))
+    cached = cache_read_prices(all_tickers, start_date=start_date)
+    earliest = cache_earliest_date_per_ticker(all_tickers)
+    latest   = cache_latest_date_per_ticker(all_tickers)
+
+    # BACKFILL si ventana es más antigua que earliest
+    need_back = []
+    if start_date is not None:
+        sdt = pd.to_datetime(start_date).normalize()
+        for t in all_tickers:
+            e0 = earliest.get(t)
+            if e0 is None or (not pd.isna(e0) and sdt < e0):
+                need_back.append(t)
+        if need_back:
+            end_date = min([
+                (pd.to_datetime(earliest.get(t)) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                if earliest.get(t) is not None else datetime.utcnow().strftime("%Y-%m-%d")
+                for t in need_back
+            ])
+            back_df = fetch_backfill_yf(need_back, start_date, end_date)
+            if not back_df.empty: cache_append_prices(back_df)
+
+    # FORWARD si falta desde última fecha
+    today = pd.Timestamp(datetime.utcnow().date())
+    needs, start_map = [], {}
+    for t in all_tickers:
+        ld = latest.get(t)
+        if ld is None or pd.Timestamp(ld).normalize() < today:
+            needs.append(t)
+            start_map[t] = start_date if ld is None else pd.to_datetime(ld).strftime("%Y-%m-%d")
+    if needs:
+        missing_df = fetch_from_yf_missing(needs, start_map, end_date=None)
+        if not missing_df.empty: cache_append_prices(missing_df)
+
+    consolidated = cache_read_prices(all_tickers, start_date=start_date)
+
+    failed_all = []; errs_all = []
+    if consolidated is None or consolidated.empty:
+        from_direct, failed_d, errs_d = fetch_prices_yahoo_direct(all_tickers, start=start_date, end=None)
+        if not from_direct.empty:
+            cache_append_prices(from_direct)
+            consolidated = from_direct
+        failed_all = failed_d; errs_all += errs_d
+
+    bench_ret = pd.Series(dtype=float)
+    prices = consolidated.copy()
+    if not prices.empty and bench in prices.columns:
+        bench_ret = prices[[bench]].pct_change().dropna()[bench]
+        prices = prices.drop(columns=[bench], errors="ignore")
+
+    return prices, bench_ret, (failed_all or []), (errs_all or [])
+
 # ================== MÉTRICAS ==================
 def annualize_return(d, freq=252):
     if d.empty: return np.nan
@@ -370,8 +478,8 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
     df["SignedShares"]=df.apply(signed,axis=1)
     return df
 
-# ========= NUEVO: usar el cache para “Last” antes que Internet =========
-def positions_from_tx(tx:pd.DataFrame):
+def positions_from_tx(tx:pd.DataFrame, last_hint_map:dict|None=None):
+    """Ahora acepta last_hint_map para priorizar 'Last' desde el histórico recién cargado."""
     if tx.empty:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
 
@@ -380,22 +488,19 @@ def positions_from_tx(tx:pd.DataFrame):
     if not uniq:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
 
-    # 1) Últimos precios desde el cache
-    last_map = last_prices_from_cache(uniq)
+    # 1) hint del histórico (recién actualizado)
+    last_map = dict(last_hint_map or {})
 
-    # 2) Lo que falte, intentar yfinance
+    # 2) lo que falte, yfinance
     missing = [t for t in uniq if (t not in last_map) or pd.isna(last_map.get(t))]
     if missing:
         lm2, failed_lp = last_prices_yf_safe(missing)
         last_map.update(lm2)
         missing = [t for t in missing if (t not in last_map) or pd.isna(last_map.get(t))]
-        # 3) Todavía faltantes, intentar directo
+        # 3) fallback directo
         if missing:
-            lm3, failed_lp2 = last_prices_direct(missing)
+            lm3, _ = last_prices_direct(missing)
             last_map.update(lm3)
-            missing = [t for t in missing if (t not in last_map) or pd.isna(last_map.get(t))]
-            if missing:
-                st.caption("⚠️ Sin último precio: " + ", ".join(missing))
 
     pos=[]
     for t,grp in df.groupby("Ticker"):
@@ -411,10 +516,10 @@ def positions_from_tx(tx:pd.DataFrame):
         else:
             avg=np.nan
 
-        px=last_map.get(t, np.nan)
-        mv= sh*px if not np.isnan(px) else np.nan
+        px = last_map.get(t, np.nan)
+        mv = sh*px if not np.isnan(px) else np.nan
         inv= sh*avg if not np.isnan(avg) else np.nan
-        pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
+        pl = mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
         pos.append([t,sh,avg,inv,px,mv,pl])
 
     dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
@@ -484,13 +589,6 @@ window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"],
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
-# ================== HISTÓRICOS (mismo loader robusto con cache/backfill) ==================
-# (Por brevedad, la parte de load_prices_with_fallback y backfill/forward es igual
-#  a la que ya te pasé en el último mensaje. Si la necesitas aquí otra vez, dime y
-#  te la vuelvo a pegar completa.)
-
-# ------------ Pega aquí la función load_prices_with_fallback que ya estás usando ------------
-
 # ================== HELPER DE ALINEACIÓN ==================
 def align_positions_for_view(positions_df: pd.DataFrame, weights_index: pd.Index) -> pd.DataFrame:
     if positions_df.empty: return positions_df
@@ -507,24 +605,28 @@ if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
     if st.button("🔄 Refrescar datos"): refresh_all(); st.rerun()
 
-    pos_df = positions_from_tx(tx_df)
-    if pos_df.empty:
+    # Tickers del portafolio (desde Transactions)
+    tx_tickers = sorted(set(t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).str.upper().str.strip().str.replace(" ","", regex=False)))
+    if not tx_tickers:
         st.info("No hay posiciones. Carga operaciones en 'Transactions'."); st.stop()
 
-    tickers = pos_df["Ticker"].tolist()
+    # 1) Poblar/actualizar HISTÓRICO en cache (backfill + forward) ANTES de calcular posiciones
+    prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tx_tickers, benchmark, start_date)
 
-    # Usa tu loader actual (con cache/backfill). Omito aquí por espacio.
-    # prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-    prices = cache_read_prices(tickers + [benchmark], start_date)  # opcional: arranque más rápido
-    bench_ret = pd.Series(dtype=float)
-    if prices is not None and not prices.empty and benchmark in prices.columns:
-        bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
-        prices = prices.drop(columns=[benchmark], errors="ignore")
+    # 2) Usar el último close del histórico como 'hint' para Last
+    last_hint_map = {}
+    if prices is not None and not prices.empty:
+        last_hint_map = prices.ffill().iloc[-1].dropna().astype(float).to_dict()
 
+    # 3) Construir posiciones usando el hint (y sólo si falta, acudir a YF/directo)
+    pos_df = positions_from_tx(tx_df, last_hint_map=last_hint_map)
+    if pos_df.empty:
+        st.info("No hay posiciones válidas tras procesar Transactions."); st.stop()
+
+    # 4) Pesos y tabla
     w = weights_from_positions(pos_df)
     pos_df_view = align_positions_for_view(pos_df, w.index)
 
-    # Cálculos de tabla (robustos)
     since_buy = (pos_df.set_index("Ticker")["MarketPrice"]/pos_df.set_index("Ticker")["AvgCost"] - 1)\
                 .replace([np.inf,-np.inf], np.nan)
     window_change = pd.Series(index=pos_df_view["Ticker"], dtype=float)
@@ -532,7 +634,6 @@ if page=="Mi Portafolio":
         window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1)\
                         .reindex(pos_df_view["Ticker"]).fillna(np.nan)
 
-    # --------- TABLA (sin columna "#") + columna "➖" ----------
     view = pd.DataFrame({
         "Ticker": pos_df_view["Ticker"].values,
         "Shares": pos_df_view["Shares"].values,
@@ -546,13 +647,9 @@ if page=="Mi Portafolio":
         "➖": [False]*len(pos_df_view)
     }).replace([np.inf,-np.inf], np.nan)
 
-    colcfg = {
-        "➖": st.column_config.CheckboxColumn(label="➖", help="Marcar para eliminar este ticker", width="small", default=False)
-    }
-
+    colcfg = {"➖": st.column_config.CheckboxColumn(label="➖", help="Marcar para eliminar este ticker", width="small", default=False)}
     edited = st.data_editor(view, hide_index=True, use_container_width=True,
-                            column_config=colcfg,
-                            disabled=[c for c in view.columns if c!="➖"],
+                            column_config=colcfg, disabled=[c for c in view.columns if c!="➖"],
                             key="positions_editor")
 
     prev = st.session_state.get("prev_editor_df")
@@ -605,7 +702,7 @@ if page=="Mi Portafolio":
             st.plotly_chart(px.pie(alloc, names="Ticker", values="Weight", title="Asignación"), use_container_width=True)
     elif len(w)==0:
         st.info("No hay pesos válidos para calcular métricas.")
-    elif prices is None or prices.empty or prices.shape[0] < 2:
+    else:
         st.info("Necesito al menos 2 días de histórico para calcular métricas.")
 
-# (Las demás páginas quedan igual que ya las tienes)
+# ================== (Resto de páginas igual que ya tienes) ==================
