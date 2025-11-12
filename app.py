@@ -1,4 +1,4 @@
-# APP Finanzas – Portafolio Activo (botón eliminar en la tabla, fixes)
+# APP Finanzas – Portafolio Activo (eliminar dentro de la tabla con CheckboxColumn "➖")
 from datetime import datetime, timedelta, timezone
 import os, time
 import numpy as np
@@ -25,6 +25,10 @@ st.markdown("""
 section[data-testid="stSidebar"] { border-right: 1px solid #1e2435; }
 div[data-testid="stMetricValue"]{font-size:1.6rem}
 [data-testid="stHeader"] { background: rgba(0,0,0,0); }
+
+/* Hace pequeña la última columna y pinta el encabezado en rojo */
+th:has(> div:contains("➖")) { color: #ff4d4f !important; width: 48px !important; }
+td:has(input[type="checkbox"]) { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -45,11 +49,7 @@ except Exception as e:
 
 # ================== CACHES ==================
 def refresh_all():
-    for f in (
-        read_sheet, load_all_data,
-        fetch_prices_yahoo_direct, fetch_prices_yf,
-        last_prices_direct, last_prices_yf
-    ):
+    for f in (read_sheet, load_all_data, fetch_prices_yahoo_direct, fetch_prices_yf, last_prices_direct, last_prices_yf):
         try: f.clear()
         except Exception: pass
     try: st.cache_data.clear()
@@ -74,7 +74,6 @@ def load_all_data():
             return df
         except Exception:
             return pd.DataFrame(columns=cols)
-
     tx_cols = ["TradeID","Account","Ticker","Name","AssetType","Currency",
                "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
                "GrossAmount","NetAmount","LotID","Source","Notes"]
@@ -139,7 +138,7 @@ def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
         p1 = _unix(start) if start else None
         p2 = _unix(end) if end else int(pd.Timestamp.utcnow().timestamp())
         if p1: params["period1"] = p1
-        params["period2"] = p2  # <- obligatorio si hay period1
+        params["period2"] = p2
     headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
     last_err = None
     for host in HOSTS:
@@ -236,7 +235,7 @@ def last_prices_yf(tickers):
             try:
                 d = yf.download(t, period="15d", interval="1d",
                                 auto_adjust=True, progress=False, threads=False)
-                if d is not None and not d.empty and "Close" in d.columns:  # <-- fix
+                if d is not None and not d.empty and "Close" in d.columns:
                     s = d["Close"].dropna().ffill()
                     if not s.empty:
                         out[t] = float(s.iloc[-1]); ok = True; break
@@ -301,13 +300,11 @@ def positions_from_tx(tx:pd.DataFrame):
     uniq=sorted(df["Ticker"].unique().tolist())
     if not uniq:
         return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-
     last_map, failed_lp = last_prices_yf(uniq)
     if failed_lp:
         last_map2, failed_lp2 = last_prices_direct(failed_lp)
         last_map.update(last_map2)
         failed_lp = failed_lp2
-
     pos=[]
     for t,grp in df.groupby("Ticker"):
         sh=float(grp["SignedShares"].sum())
@@ -326,7 +323,6 @@ def positions_from_tx(tx:pd.DataFrame):
         inv= sh*avg if not np.isnan(avg) else np.nan
         pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
         pos.append([t,sh,avg,inv,px,mv,pl])
-    
     dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
     if failed_lp: st.caption("⚠️ Sin último precio: " + ", ".join(failed_lp))
     return dfp.sort_values("MarketValue",ascending=False)
@@ -366,7 +362,6 @@ def max_sharpe(mean_ret, cov, rf=0.0, bounds=None):
 
 # ======= Helpers para eliminar en Sheets =======
 def delete_transactions_by_ticker(ticker:str)->int:
-    """Elimina TODAS las filas de 'Transactions' cuyo Ticker == ticker (case-insensitive)."""
     ws = get_worksheet("Transactions")
     values = ws.get_all_values()
     if not values: return 0
@@ -386,7 +381,7 @@ def delete_transactions_by_ticker(ticker:str)->int:
 # ================== CARGA BASE ==================
 tx_df, settings_df, watch_df = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","SPY",str)  # SPY por defecto
+benchmark = get_setting(settings_df,"Benchmark","SPY",str)
 w_min = get_setting(settings_df,"MinWeightPerAsset",0.0,float)
 w_max = get_setting(settings_df,"MaxWeightPerAsset",0.30,float)
 
@@ -438,7 +433,6 @@ if page=="Mi Portafolio":
 
     tickers = pos_df["Ticker"].tolist()
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-
     if prices.empty or len(prices.columns)==0:
         st.warning("No se pudieron obtener precios históricos desde Yahoo.")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
@@ -453,7 +447,7 @@ if page=="Mi Portafolio":
     window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df["Ticker"]).fillna(np.nan)
     pos_df = pos_df.set_index("Ticker").loc[w.index].reset_index()
 
-    # --------- TABLA (sin columna "#") + botón 'Eliminar' integrado ----------
+    # --------- TABLA (sin columna "#") + columna "➖" para eliminar ----------
     view = pd.DataFrame({
         "Ticker": pos_df["Ticker"].values,
         "Shares": pos_df["Shares"].values,
@@ -464,7 +458,7 @@ if page=="Mi Portafolio":
         "Δ % ventana": (window_change.reindex(pos_df["Ticker"]).values*100.0),
         "Peso %": (w.reindex(pos_df["Ticker"]).values*100.0),
         "Valor": pos_df["MarketValue"].values,
-        "Eliminar": ["Eliminar"]*len(pos_df)  # columna de botón
+        "➖": [False]*len(pos_df)  # CheckboxColumn (clic = solicitar eliminar)
     }).replace([np.inf,-np.inf], np.nan)
 
     money_fmt = {"Avg Buy":"${:,.2f}","Last":"${:,.2f}","P/L $":"${:,.2f}","Valor":"${:,.2f}"}
@@ -473,38 +467,34 @@ if page=="Mi Portafolio":
         if pd.isna(val): return "color: inherit;"
         return "color: #18b26b;" if val>=0 else "color: #ff4d4f;"
 
-    # Formateo visual (no editable) lo seguimos usando para colores
-    styled = (view.style
-        .format({**money_fmt, **pct_fmt}, na_rep="—")
-        .applymap(color_pct, subset=["P/L % (compra)","Δ % ventana"])
-        .set_properties(subset=["Ticker","Shares"], **{"font-weight":"600"})
-    )
-
-    # Data editor con botón pequeño rojo
     colcfg = {
-        "Eliminar": st.column_config.ButtonColumn(
-            label="", help="Eliminar este ticker",
-            icon=":material/remove_circle:",   # círculo con signo menos (rojo por tema)
-            width="small"
+        "➖": st.column_config.CheckboxColumn(
+            label="➖", help="Marcar para eliminar este ticker de Transactions",
+            width="small", default=False
         )
     }
 
-    # mostramos el editor; deshabilitamos el resto de columnas
-    editor = st.data_editor(
+    edited = st.data_editor(
         view, hide_index=True, use_container_width=True,
         column_config=colcfg,
-        disabled=[c for c in view.columns if c!="Eliminar"],
-        key="positions_table"
+        disabled=[c for c in view.columns if c!="➖"],
+        key="positions_editor"
     )
 
-    # detectar clic (Streamlit guarda en "<key>_button_clicked")
-    clicks = st.session_state.get("positions_table_button_clicked")
-    if isinstance(clicks, dict) and clicks.get("column") == "Eliminar":
-        row_idx = clicks.get("row")
-        if row_idx is not None and 0 <= row_idx < len(editor):
-            st.session_state["delete_candidate"] = str(editor.iloc[row_idx]["Ticker"])
+    # Detectar cuál fila se marcó (nueva marca respecto al estado previo)
+    prev = st.session_state.get("prev_editor_df")
+    if prev is None:
+        st.session_state["prev_editor_df"] = edited.copy()
+    else:
+        # filas cuyo checkbox pasó de False -> True
+        mark = (edited["➖"] == True) & (prev["➖"] != True)
+        if mark.any():
+            row_idx = mark[mark].index[0]
+            tkr_clicked = edited.iloc[row_idx]["Ticker"]
+            st.session_state["delete_candidate"] = str(tkr_clicked)
+        st.session_state["prev_editor_df"] = edited.copy()
 
-    # Modal de confirmación
+    # Confirmación
     if st.session_state.get("delete_candidate"):
         tkr = st.session_state["delete_candidate"]
         st.warning(f"¿Seguro que quieres eliminar **todas** las transacciones de **{tkr}** en *Transactions*?")
@@ -513,6 +503,8 @@ if page=="Mi Portafolio":
             if st.button("✅ Sí, eliminar"):
                 deleted = delete_transactions_by_ticker(tkr)
                 st.session_state["delete_candidate"] = ""
+                # limpiar marcas
+                st.session_state["prev_editor_df"]["➖"] = False
                 if deleted>0:
                     st.success(f"Se eliminaron {deleted} fila(s) de {tkr} en Transactions.")
                 else:
@@ -521,9 +513,10 @@ if page=="Mi Portafolio":
         with c2:
             if st.button("❌ No, cancelar"):
                 st.session_state["delete_candidate"] = ""
+                st.session_state["prev_editor_df"]["➖"] = False
                 st.info("Operación cancelada.")
 
-    # KPIs y curva
+    # KPIs y gráfico
     c_top1, c_top2 = st.columns([2,1])
     with c_top1:
         st.subheader("Composición y rendimiento (constante)")
@@ -536,7 +529,6 @@ if page=="Mi Portafolio":
         c4.metric("Max Drawdown", f"{(mdd or 0)*100:,.2f}%")
         c5.metric("Sortino", f"{(sortino(port_ret, rf) or 0):.2f}")
         c6.metric("Calmar", f"{(calmar(port_ret) or 0):.2f}")
-
         curve=pd.DataFrame({"Portafolio":(1+port_ret).cumprod()})
         if not bench_ret.empty:
             curve["Benchmark"]=(1+bench_ret).cumprod().reindex(curve.index).ffill()
@@ -551,10 +543,8 @@ elif page=="Optimizar y Rebalancear":
     st.title("🛠️ Optimizar y Rebalancear")
     pos_df = positions_from_tx(tx_df)
     if pos_df.empty: st.info("No hay posiciones."); st.stop()
-
     tickers = pos_df["Ticker"].tolist()
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-
     if prices.empty:
         st.warning("No hay precios para optimizar (Yahoo).")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
@@ -562,7 +552,6 @@ elif page=="Optimizar y Rebalancear":
             with st.expander("Detalles de errores Yahoo"): 
                 for e in errs_all: st.code(e)
         st.stop()
-
     if failed_all:
         st.caption("⚠️ Excluidos por falta de histórico: " + ", ".join(sorted(set(failed_all))))
         good = [c for c in prices.columns if prices[c].notna().any()]
@@ -574,15 +563,10 @@ elif page=="Optimizar y Rebalancear":
     if asset_rets.empty:
         st.warning("No hay retornos suficientes para optimizar."); st.stop()
 
-    mean_daily=asset_rets.mean()
-    cov=asset_rets.cov()
-    mu_ann=(1+mean_daily)**252-1
-
-    n=len(mu_ann)
-    bounds=[(w_min,w_max)]*n
+    mean_daily=asset_rets.mean(); cov=asset_rets.cov(); mu_ann=(1+mean_daily)**252-1
+    n=len(mu_ann); bounds=[(w_min,w_max)]*n
     w_opt_arr = max_sharpe(mu_ann.values, cov.values, rf=rf, bounds=bounds)
-    w_opt = pd.Series(w_opt_arr, index=mu_ann.index).clip(lower=w_min, upper=w_max)
-    w_opt /= w_opt.sum()
+    w_opt = pd.Series(w_opt_arr, index=mu_ann.index).clip(lower=w_min, upper=w_max); w_opt /= w_opt.sum()
 
     port_ret_opt,_ = const_weight_returns(prices, w_opt)
     c1,c2,c3,c4=st.columns(4)
@@ -593,19 +577,21 @@ elif page=="Optimizar y Rebalancear":
 
     compare=pd.DataFrame({"Weight Actual":w_cur,"Weight Propuesto":w_opt}).fillna(0)
     compare["Δ (pp)"]=(compare["Weight Propuesto"]-compare["Weight Actual"])*100
-    st.dataframe(compare.style.format({"Weight Actual":"{:,.2%}","Weight Propuesto":"{:,.2%}","Δ (pp)":"{:,.2f}"}), use_container_width=True)
+    st.data_editor(compare, hide_index=False, use_container_width=True,
+                   column_config={"Weight Actual":st.column_config.NumberColumn(format="%.2f%%"),
+                                  "Weight Propuesto":st.column_config.NumberColumn(format="%.2f%%"),
+                                  "Δ (pp)":st.column_config.NumberColumn(format="%.2f")},
+                   disabled=list(compare.columns))
 
 # ================== EVALUAR CANDIDATO ==================
 elif page=="Evaluar Candidato":
     st.title("🧪 Evaluar Candidato")
     pos_df = positions_from_tx(tx_df)
     if pos_df.empty: st.info("Sin posiciones."); st.stop()
-
     tkr = st.text_input("Ticker a evaluar", value="AAPL").upper().strip().replace(" ","")
     if not tkr: st.stop()
     tickers = sorted(set(pos_df["Ticker"].tolist()+[tkr]))
     prices, bench_ret, failed_all, errs_all = load_prices_with_fallback(tickers, benchmark, start_date)
-
     if prices.empty:
         st.warning("No se pudieron descargar precios desde Yahoo.")
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
@@ -613,15 +599,12 @@ elif page=="Evaluar Candidato":
             with st.expander("Detalles de errores Yahoo"):
                 for e in errs_all: st.code(e)
         st.stop()
-
     w_cur = weights_from_positions(pos_df)
     last_map, fail_lp = last_prices_yf([tkr])
     if fail_lp:
-        last_map2, _ = last_prices_direct(fail_lp)
-        last_map.update(last_map2)
+        last_map2, _ = last_prices_direct(fail_lp); last_map.update(last_map2)
     last = last_map.get(tkr, np.nan)
     if np.isnan(last): st.warning("Ticker inválido o sin último precio (Yahoo)."); st.stop()
-
     mode = st.radio("Forma de evaluación", ["Asignar porcentaje","Añadir acciones"], horizontal=True)
     if mode=="Asignar porcentaje":
         pct=st.slider("Peso objetivo del candidato",0.0,0.40,0.10,0.01)
@@ -630,7 +613,6 @@ elif page=="Evaluar Candidato":
         qty=st.number_input("Acciones a comprar (simulado)",min_value=1,value=5,step=1)
         pv=pos_df["MarketValue"].sum(); add=qty*last; base=pv+add if (pv+add)>0 else 1.0
         w_new=(w_cur*pv)/base; w_new=w_new.reindex(prices.columns).fillna(0.0); w_new[tkr]+=add/base
-
     port_cur,_=const_weight_returns(prices, w_cur.reindex(prices.columns, fill_value=0))
     port_new,_=const_weight_returns(prices, w_new.reindex(prices.columns, fill_value=0))
     c=st.columns(4)
@@ -641,8 +623,7 @@ elif page=="Evaluar Candidato":
     cum_cur=(1+port_cur).cumprod(); cum_new=(1+port_new).cumprod()
     mdd_cur=max_drawdown(cum_cur); mdd_new=max_drawdown(cum_new)
     c[2].metric("MDD actual", f"{(0 if pd.isna(mdd_cur) else mdd_cur)*100:,.2f}%")
-    c[3].metric("MDD con candidato", f"{(0 if pd.isna(mdd_new) else mdd_new)*100:,.2f}%",
-                delta=None if (pd.isna(mdd_cur) or pd.isna(mdd_new)) else f"{((mdd_new-mdd_cur)*100):.2f}%")
+    c[3].metric("MDD con candidato", f"{(0 if pd.isna(mdd_new) else mdd_new)*100:,.2f}%")
 
 # ================== EXPLORAR / DIAGNÓSTICO ==================
 elif page=="Explorar / Research":
@@ -665,7 +646,6 @@ elif page=="Explorar / Research":
             if errs_all:
                 with st.expander("Detalles de errores Yahoo"):
                     for e in errs_all: st.code(e)
-
 elif page=="Diagnóstico":
     st.title("🩺 Diagnóstico rápido")
     col1,col2=st.columns(2)
@@ -678,15 +658,12 @@ elif page=="Diagnóstico":
             st.success("Hojas encontradas:"); st.write(titles)
         except Exception as e:
             st.error(f"No pude listar hojas: {e}")
-
         st.subheader("Settings")
         st.dataframe(load_all_data()[1], use_container_width=True)
-
     with col2:
         st.subheader("Ping yfinance (SPY 30d)")
         try:
-            test = yf.download("SPY", period="30d", interval="1d", auto_adjust=True,
-                               progress=False, threads=False)
+            test = yf.download("SPY", period="30d", interval="1d", auto_adjust=True, progress=False, threads=False)
             if test is None or test.empty:
                 st.warning("Sin datos por yfinance (posible rate-limit/bloqueo de red).")
             else:
@@ -694,7 +671,6 @@ elif page=="Diagnóstico":
                 st.dataframe(test.tail(5))
         except Exception as e:
             st.error(f"Error yfinance: {e}")
-
         st.subheader("Ping Yahoo directo (MSFT 30d)")
         try:
             s, err = _direct_one("MSFT", interval="1d")
@@ -706,7 +682,6 @@ elif page=="Diagnóstico":
                 if err: st.code(err)
         except Exception as e:
             st.error(f"Error directo: {e}")
-
     st.subheader("Transactions (muestra)")
     st.dataframe(load_all_data()[0].head(10), use_container_width=True)
 
