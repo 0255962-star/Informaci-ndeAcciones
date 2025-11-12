@@ -113,7 +113,6 @@ def _clean_tickers(tickers):
 CACHE_SHEET_NAME = "PricesCache"   # columnas A:C -> Date | Ticker | Close
 
 def _ensure_cache_sheet():
-    """Crea la hoja PricesCache si no existe, con encabezados."""
     sh = gc.open_by_key(SHEET_ID)
     titles = [w.title for w in sh.worksheets()]
     if CACHE_SHEET_NAME not in titles:
@@ -127,10 +126,6 @@ def _get_cache_ws():
 
 @st.cache_data(ttl=0, show_spinner=False)
 def cache_read_prices(tickers, start_date=None):
-    """
-    Lee de PricesCache y devuelve un DataFrame wide (index=fecha, cols=tickers).
-    start_date: 'YYYY-MM-DD' o None.
-    """
     ws = _get_cache_ws()
     values = ws.get_all_values()
     if not values or len(values) < 2:
@@ -164,7 +159,6 @@ def cache_read_prices(tickers, start_date=None):
 
 @st.cache_data(ttl=0, show_spinner=False)
 def cache_latest_date_per_ticker(tickers):
-    """Regresa dict {ticker: ultima_fecha_en_cache} (o None si no hay)."""
     ws = _get_cache_ws()
     values = ws.get_all_values()
     out = {t: None for t in tickers}
@@ -187,7 +181,6 @@ def cache_latest_date_per_ticker(tickers):
 
 @st.cache_data(ttl=0, show_spinner=False)
 def cache_earliest_date_per_ticker(tickers):
-    """Regresa dict {ticker: primera_fecha_en_cache} (o None si no hay)."""
     ws = _get_cache_ws()
     values = ws.get_all_values()
     out = {t: None for t in tickers}
@@ -209,19 +202,13 @@ def cache_earliest_date_per_ticker(tickers):
     return out
 
 def cache_append_prices(df_wide):
-    """
-    Recibe un DataFrame wide (index fechas, columnas tickers, valores Close)
-    y lo inserta (append) en PricesCache, evitando duplicados básicos.
-    """
     if df_wide is None or df_wide.empty:
         return 0
     ws = _get_cache_ws()
 
-    # normaliza index
     df_wide = df_wide.copy()
     df_wide.index = pd.to_datetime(df_wide.index).normalize()
 
-    # Leemos cache existente para deduplicar
     existing = cache_read_prices(list(df_wide.columns))
     to_write = df_wide.copy()
 
@@ -250,12 +237,6 @@ def cache_append_prices(df_wide):
     return total
 
 def fetch_from_yf_missing(tickers, start_map, end_date=None):
-    """
-    Descarga de yfinance SOLO lo faltante hacia adelante por ticker.
-    start_map: dict {ticker: fecha_inicio} (si None -> 10 años).
-    end_date: str 'YYYY-MM-DD' o None.
-    Devuelve DF wide de Close.
-    """
     starts = [d for d in start_map.values() if d is not None]
     if starts:
         min_start = min(starts)
@@ -293,9 +274,6 @@ def fetch_from_yf_missing(tickers, start_map, end_date=None):
     return pd.DataFrame()
 
 def fetch_backfill_yf(tickers, start_date, end_date):
-    """
-    Descarga histórico HACIA ATRÁS cuando start_date < primera fecha en cache.
-    """
     if start_date is None or end_date is None:
         return pd.DataFrame()
     tickers_clean = [t.upper().strip().replace(" ","") for t in tickers]
@@ -580,12 +558,6 @@ start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period
 
 # ================== CARGA DE PRECIOS (cache + backfill + forward-fill) ==================
 def load_prices_with_fallback(tickers, bench, start_date):
-    """
-    1) Lee cache (PricesCache) para tickers + benchmark.
-    2) Si ventana pedida (start_date) < primera fecha en cache -> BACKFILL.
-    3) Si falta desde última fecha hasta hoy -> FORWARD-INCREMENTAL.
-    4) Devuelve (prices_sin_benchmark, benchmark_returns, failed, errs).
-    """
     all_tickers = list(dict.fromkeys((tickers or []) + [bench]))
 
     # 1) leer cache existente
@@ -595,31 +567,24 @@ def load_prices_with_fallback(tickers, bench, start_date):
     earliest = cache_earliest_date_per_ticker(all_tickers)
     latest   = cache_latest_date_per_ticker(all_tickers)
 
-    # -------- BACKFILL (si la ventana pide fechas más antiguas que earliest) --------
+    # -------- BACKFILL --------
     need_back = []
-    back_start_map = {}
     if start_date is not None:
         sdt = pd.to_datetime(start_date).normalize()
         for t in all_tickers:
             e0 = earliest.get(t)
             if e0 is None or (not pd.isna(e0) and sdt < e0):
                 need_back.append(t)
-                # si no hay earliest, pedimos 10 años hacia atrás desde sdt
-                back_start_map[t] = start_date
         if need_back:
-            end_map = {}
-            for t in need_back:
-                e0 = earliest.get(t)
-                if e0 is None:
-                    # bajamos desde start_date hasta hoy (luego forward acota)
-                    end_map[t] = datetime.utcnow().strftime("%Y-%m-%d")
-                else:
-                    end_map[t] = (pd.to_datetime(e0) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            back_df = fetch_backfill_yf(need_back, start_date, min(end_map.values()))
+            # backfill hasta la fecha mínima de earliest-1d (o hoy si no hay earliest)
+            end_date = min([ (pd.to_datetime(earliest.get(t)) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                              if earliest.get(t) is not None else datetime.utcnow().strftime("%Y-%m-%d")
+                              for t in need_back ])
+            back_df = fetch_backfill_yf(need_back, start_date, end_date)
             if back_df is not None and not back_df.empty:
                 cache_append_prices(back_df)
 
-    # -------- FORWARD (si falta desde la última fecha en cache hasta hoy) --------
+    # -------- FORWARD --------
     today = pd.Timestamp(datetime.utcnow().date())
     needs = []
     start_map = {}
@@ -633,10 +598,9 @@ def load_prices_with_fallback(tickers, bench, start_date):
         if missing_df is not None and not missing_df.empty:
             cache_append_prices(missing_df)
 
-    # 4) consolidado del cache (ya actualizado)
+    # 4) consolidado del cache
     consolidated = cache_read_prices(all_tickers, start_date=start_date)
 
-    # Fallback directo si aún no hay nada
     failed_all = []; errs_all = []
     if consolidated is None or consolidated.empty:
         from_direct, failed_d, errs_d = fetch_prices_yahoo_direct(all_tickers, start=start_date, end=None)
@@ -652,6 +616,19 @@ def load_prices_with_fallback(tickers, bench, start_date):
         prices = prices.drop(columns=[bench], errors="ignore")
 
     return prices, bench_ret, (failed_all or []), (errs_all or [])
+
+# Helper SEGURO para alinear y mantener columna 'Ticker'
+def align_positions_for_view(positions_df: pd.DataFrame, weights_index: pd.Index) -> pd.DataFrame:
+    if positions_df.empty:
+        return positions_df
+    tmp = positions_df.set_index("Ticker")
+    if weights_index is not None and len(weights_index) > 0:
+        tmp = tmp.reindex(weights_index)
+    out = tmp.reset_index()
+    # Si por alguna razón la columna quedó como 'index', la renombramos a 'Ticker'
+    if "Ticker" not in out.columns and "index" in out.columns:
+        out = out.rename(columns={"index": "Ticker"})
+    return out
 
 # ================== MI PORTAFOLIO ==================
 if page=="Mi Portafolio":
@@ -669,29 +646,30 @@ if page=="Mi Portafolio":
         if failed_all: st.caption("Fallidos: " + ", ".join(sorted(set(failed_all))))
         st.stop()
 
-    # Salvaguarda: si hay menos de 2 días, avisamos (evita métricas y gráfico planos)
-    if prices.shape[0] < 2:
-        st.info("Necesito al menos 2 días de histórico para calcular métricas. Se está completando el cache; vuelve a intentarlo en segundos.")
-        # seguimos mostrando la tabla de posiciones:
     w = weights_from_positions(pos_df)
+
+    # Alinear posiciones de forma segura (ARREGLO PRINCIPAL)
+    pos_df_view = align_positions_for_view(pos_df, w.index)
 
     # Cálculos de tabla
     since_buy = (pos_df.set_index("Ticker")["MarketPrice"]/pos_df.set_index("Ticker")["AvgCost"] - 1).replace([np.inf,-np.inf], np.nan)
-    window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df["Ticker"]).fillna(np.nan)
-    pos_df = pos_df.set_index("Ticker").loc[w.index].reset_index()
+    try:
+        window_change = (prices.ffill().iloc[-1]/prices.ffill().iloc[0]-1).reindex(pos_df_view["Ticker"]).fillna(np.nan)
+    except Exception:
+        window_change = pd.Series(index=pos_df_view["Ticker"], dtype=float)
 
     # --------- TABLA (sin columna "#") + columna "➖" para eliminar ----------
     view = pd.DataFrame({
-        "Ticker": pos_df["Ticker"].values,
-        "Shares": pos_df["Shares"].values,
-        "Avg Buy": pos_df["AvgCost"].values,
-        "Last": pos_df["MarketPrice"].values,
-        "P/L $": pos_df["UnrealizedPL"].values,
-        "P/L % (compra)": (since_buy.reindex(pos_df["Ticker"]).values*100.0),
-        "Δ % ventana": (window_change.reindex(pos_df["Ticker"]).values*100.0),
-        "Peso %": (w.reindex(pos_df["Ticker"]).values*100.0),
-        "Valor": pos_df["MarketValue"].values,
-        "➖": [False]*len(pos_df)
+        "Ticker": pos_df_view["Ticker"].values,
+        "Shares": pos_df_view["Shares"].values,
+        "Avg Buy": pos_df_view["AvgCost"].values,
+        "Last": pos_df_view["MarketPrice"].values,
+        "P/L $": pos_df_view["UnrealizedPL"].values,
+        "P/L % (compra)": (since_buy.reindex(pos_df_view["Ticker"]).values*100.0),
+        "Δ % ventana": (window_change.reindex(pos_df_view["Ticker"]).values*100.0),
+        "Peso %": (w.reindex(pos_df_view["Ticker"]).values*100.0),
+        "Valor": pos_df_view["MarketValue"].values,
+        "➖": [False]*len(pos_df_view)
     }).replace([np.inf,-np.inf], np.nan)
 
     colcfg = {
@@ -741,7 +719,7 @@ if page=="Mi Portafolio":
                 st.info("Operación cancelada.")
 
     # ---- KPIs y gráfico (solo si hay ≥ 2 días) ----
-    if prices.shape[0] >= 2:
+    if prices.shape[0] >= 2 and len(w)>0:
         c_top1, c_top2 = st.columns([2,1])
         with c_top1:
             port_ret, _ = const_weight_returns(prices, w)
@@ -760,6 +738,10 @@ if page=="Mi Portafolio":
         with c_top2:
             alloc = pd.DataFrame({"Ticker":w.index,"Weight":w.values})
             st.plotly_chart(px.pie(alloc, names="Ticker", values="Weight", title="Asignación"), use_container_width=True)
+    elif prices.shape[0] < 2:
+        st.info("Necesito al menos 2 días de histórico para calcular métricas. El cache se está completando.")
+    else:
+        st.info("No hay pesos válidos para calcular métricas.")
 
 # ================== OPTIMIZAR ==================
 elif page=="Optimizar y Rebalancear":
