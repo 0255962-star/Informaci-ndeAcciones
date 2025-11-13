@@ -1,6 +1,4 @@
-# APP Finanzas – Portafolio con histórico en Google Sheets, autodetección de hoja/encabezados,
-# sync incremental y FIX por columnas de Fees/NetAmount como fechas
-
+# APP Finanzas – Portafolio con histórico en Google Sheets (locale-aware numbers)
 from datetime import datetime, timedelta, timezone, date
 import os, time, logging, re
 import numpy as np
@@ -13,7 +11,7 @@ from scipy.optimize import minimize
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ================== CONFIG UI ==================
+# ================== UI ==================
 st.set_page_config(page_title="APP Finanzas – Portafolio Activo", page_icon="💼", layout="wide")
 st.markdown("""
 <style>
@@ -44,7 +42,7 @@ try:
 except Exception as e:
     st.error(f"No se pudo autorizar Google Sheets: {e}"); st.stop()
 
-# ================== UTILIDADES GENERALES ==================
+# ================== UTILS ==================
 def refresh_all():
     for f in (
         read_sheet, load_all_data, find_cache_sheet, cache_read_prices, cache_latest_date_per_ticker,
@@ -64,27 +62,51 @@ def _clean_tickers(tickers):
         if t and t not in out: out.append(t)
     return out
 
-# ---- FIX datetimes en numéricos ----
 def _is_dtlike(x):
     return isinstance(x, (pd.Timestamp, datetime, date))
 
-def _to_float(x):
-    """Convierte a float, ignorando fechas/objetos que no son números; limpia comas y símbolos."""
-    if x is None or (isinstance(x,float) and np.isnan(x)): return np.nan
-    if _is_dtlike(x):  # <- fechas NO son números
-        return np.nan
-    if isinstance(x,(int,float)): return float(x)
-    s=str(x).strip()
-    # quitar separadores y símbolos: $ , espacios, etc.
-    s=re.sub(r"[^\d\.\-]", "", s.replace(",", ""))
+def _parse_number(x):
+    """
+    Locale-aware:
+      - Detecta el ÚLTIMO separador como decimal
+      - El otro separador lo trata como miles y lo elimina
+      - Soporta: '45.778,00' -> 45778.00, '7,178,500.366' -> 7178500.366, '1 234,56', '$ 1.234,56'
+    """
+    if x is None: return np.nan
+    if isinstance(x,(int,float)):
+        # evitar fechas serializadas de Excel (número grande ~ 40000-50000) en campos de Fees/Taxes, las conservamos; se limpiarán arriba si son datetime
+        return float(x)
+    if _is_dtlike(x): return np.nan
+    s = str(x).strip()
+    if s == "": return np.nan
+    # quitar símbolos
+    s = re.sub(r"[^\d,\.\-\s]", "", s)
+    s = s.replace(" ", "")
+    # ambos separadores presentes
+    if "," in s and "." in s:
+        last_comma = s.rfind(",")
+        last_dot   = s.rfind(".")
+        if last_comma > last_dot:
+            # coma decimal, punto de miles
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            # punto decimal, coma de miles
+            s = s.replace(",", "")
+    else:
+        # solo uno o ninguno
+        # si solo hay comas: trátalas como decimal
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+        # si solo hay puntos: ya es decimal americano
+    # colapsar signos raros
     if s in ("", ".", "-", "-.", ".-"): return np.nan
     try:
-        val=float(s)
-        return val
+        return float(s)
     except:
         return np.nan
 
-# ================== SHEETS R/W ==================
+# ================== SHEETS ==================
 @st.cache_data(ttl=600, show_spinner=False)
 def read_sheet(name:str)->pd.DataFrame:
     sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
@@ -120,7 +142,7 @@ def get_setting(settings_df, key, default=None, cast=float):
     except Exception:
         return default
 
-# ================== DETECCIÓN DE HOJA HISTÓRICA ==================
+# ================== HISTÓRICO PRECIOS ==================
 CACHE_CANON = "PricesCache"
 
 def _norm_cols(cols):
@@ -173,7 +195,8 @@ def cache_read_prices(tickers, start_date=None):
     if df.empty: return pd.DataFrame()
     df[dcol] = pd.to_datetime(df[dcol], errors="coerce").dt.normalize()
     df[tcol] = df[tcol].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
-    df[ccol] = df[ccol].map(_to_float)
+    # <<< USAR PARSER LOCALE-AWARE PARA CLOSE >>>
+    df[ccol] = df[ccol].map(_parse_number)
     df = df.dropna(subset=[dcol,tcol,ccol])
     if start_date:
         df = df[df[dcol] >= pd.to_datetime(start_date).normalize()]
@@ -235,7 +258,6 @@ def cache_append_prices(df_wide):
         to_write = mask_new.dropna(how="all")
     if to_write.empty: return 0
 
-    # Escribir según índices reales del header (puede estar en cualquier orden/idioma)
     header_real = ws.get_all_values()[0]
     header_norm = _norm_cols(header_real)
     idx = {c:i for i,c in enumerate(header_norm)}
@@ -263,7 +285,7 @@ def cache_append_prices(df_wide):
         total += len(rows[i:i+BATCH])
     return total
 
-# ================== PRECIOS (YF/DIRECTO) ==================
+# ================== PRECIOS (descarga) ==================
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 os.environ.setdefault("YF_USER_AGENT", UA)
@@ -361,7 +383,7 @@ def last_prices_direct(tickers):
             failed.append(t)
     return out, failed
 
-# ================== SYNC HISTÓRICO (backfill + forward) ==================
+# ================== SYNC HISTÓRICO ==================
 def _single_yf_range(ticker, start, end):
     try:
         d = yf.download(ticker, start=start, end=end, interval="1d",
@@ -374,7 +396,6 @@ def _single_yf_range(ticker, start, end):
 
 def load_prices_with_fallback(tickers, bench, start_date):
     all_t = list(dict.fromkeys((tickers or []) + [bench])); all_t = _clean_tickers(all_t)
-    # backfill si la ventana arranca antes de lo que hay guardado
     earliest = cache_earliest_date_per_ticker(all_t)
     if start_date is not None:
         sdt = pd.to_datetime(start_date).normalize()
@@ -388,7 +409,6 @@ def load_prices_with_fallback(tickers, bench, start_date):
                     if not s2.empty: cache_append_prices(s2.to_frame())
                 else:
                     cache_append_prices(s.to_frame())
-    # forward hasta hoy
     latest = cache_latest_date_per_ticker(all_t)
     today = pd.Timestamp(datetime.utcnow().date())
     for t in all_t:
@@ -458,29 +478,25 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
 
     df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
     df=df.dropna(subset=["Ticker"])
-
     df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
 
-    # ---- Sanitizar Fees/Taxes/Gross/Net (pueden venir como FECHAS en tu Excel) ----
+    # columnas numéricas con parser locale-aware
     for col in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
         if col in df.columns:
-            # Si la columna es datetime → convertir a NaN primero
-            if pd.api.types.is_datetime64_any_dtype(df[col]):
-                df[col] = np.nan
-            # Convertir a número seguro
-            df[col] = df[col].map(_to_float)
+            if pd.api.types.is_datetime64_any_dtype(df[col]):  # fechas mal puestas → NaN
+                df[col]=np.nan
+            df[col]=df[col].map(_parse_number)
 
-    # Defaults razonables
+    # Defaults
     if "FXRate" in df.columns:
-        df["FXRate"] = df["FXRate"].replace(0, np.nan).fillna(1.0)
+        df["FXRate"]=df["FXRate"].replace(0,np.nan).fillna(1.0)
 
-    # Fees/Taxes negativas o absurdas → limpiar
+    # sanity caps en Fees/Taxes (anti outliers por parseo)
     for col in ["Fees","Taxes"]:
         if col in df.columns:
-            df[col] = df[col].fillna(0.0)
-            df.loc[df[col].abs()>1e6, col] = 0.0  # anti-bomba si algo raro se cuela
+            df[col]=df[col].fillna(0.0)
+            df.loc[df[col].abs()>1e7, col]=0.0
 
-    # Gross/Net no los usamos para el promedio; quedan limpios por si los usas aparte
     def signed(row):
         s=str(row.get("Side","")).lower().strip()
         q=float(row.get("Shares",0) or 0)
@@ -499,8 +515,7 @@ def positions_from_tx(tx:pd.DataFrame, last_hint_map:dict|None=None):
     last_map = dict(last_hint_map or {})
     missing = [t for t in uniq if t not in last_map or pd.isna(last_map.get(t))]
     if missing:
-        cached_fallback = last_prices_from_cache(missing)
-        last_map.update(cached_fallback)
+        cached_fallback = last_prices_from_cache(missing); last_map.update(cached_fallback)
         missing = [t for t in missing if t not in last_map or pd.isna(last_map.get(t))]
     if missing:
         lm2, _ = last_prices_yf_safe(missing); last_map.update(lm2)
@@ -560,7 +575,7 @@ def const_weight_returns(price_df:pd.DataFrame, weights:pd.Series):
     port=(rets*w).sum(axis=1)
     return port, rets
 
-# ================== ELIMINAR POR TICKER ==================
+# ================== BORRADO ==================
 def delete_transactions_by_ticker(ticker:str)->int:
     ws = get_worksheet("Transactions")
     values = ws.get_all_values()
@@ -577,7 +592,7 @@ def delete_transactions_by_ticker(ticker:str)->int:
     for ridx in reversed(to_delete): ws.delete_rows(ridx)
     return len(to_delete)
 
-# ================== CONFIG / SIDEBAR ==================
+# ================== SIDEBAR ==================
 tx_df, settings_df, _ = load_all_data()
 rf = get_setting(settings_df,"RF",0.03,float)
 benchmark = get_setting(settings_df,"Benchmark","SPY",str)
