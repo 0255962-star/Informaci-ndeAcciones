@@ -31,6 +31,17 @@ try:
 except Exception:
     pass
 
+# ================== RERUN COMPATIBLE ==================
+def safe_rerun():
+    """Usa st.rerun() (nuevo) y cae a experimental_rerun si el entorno es viejo."""
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
 # ================== SECRETS ==================
 SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
 GCP_SA   = st.secrets.get("gcp_service_account", {})
@@ -456,7 +467,7 @@ if page=="Mi Portafolio":
         for k in ("tx_master","settings_master","prices_master","bench_ret_master","last_map_master","_masters_built_at"):
             st.session_state.pop(k, None)
         build_masters(sync=True)
-        st.experimental_rerun()
+        safe_rerun()  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Primera carga de sesión: construir masters (sync una sola vez si expiró TTL)
     if need_build("prices_master") or masters_expired():
@@ -475,14 +486,12 @@ if page=="Mi Portafolio":
     else:
         prices = prices_master.copy()
 
-    # ---------- FIX: alinear benchmark por fechas sin KeyError ----------
     bench_ret = pd.Series(dtype=float)
     if bench_ret_full is not None and not bench_ret_full.empty:
         if prices is not None and not prices.empty:
-            bench_ret = bench_ret_full.reindex(prices.index).ffill()  # <- cambio clave
+            bench_ret = bench_ret_full.reindex(prices.index).ffill()
         else:
             bench_ret = bench_ret_full
-    # -------------------------------------------------------------------
 
     # Últimos precios
     last_hint_map = dict(st.session_state.get("last_map_master", {}))
@@ -551,7 +560,7 @@ if page=="Mi Portafolio":
                 for k in ("tx_master","settings_master","prices_master","bench_ret_master","last_map_master"):
                     st.session_state.pop(k, None)
                 build_masters(sync=False)
-                st.experimental_rerun()
+                safe_rerun()  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         with c2:
             if st.button("❌ No, cancelar"):
                 st.session_state["delete_candidate"] = ""
@@ -592,3 +601,4 @@ if page=="Mi Portafolio":
 elif page in ["Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Diagnóstico"]:
     st.title(page)
     st.info("Contenido no modificado. Esta sección mantiene el mismo formato de la app original.")
+
