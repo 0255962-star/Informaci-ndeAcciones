@@ -377,8 +377,6 @@ def build_masters(sync: bool):
 
     # Sync pesado solo si se pidió
     if sync:
-        # para cada ticker, completar (backfill/forward) con Yahoo y escribir a cache
-        # estrategia simple: si no hay nada, 3 años; si hay algo, desde último +1 día
         ws, meta = _get_cache_ws()
         cache = cache_read_prices(all_t, start_date=None)
         today = pd.Timestamp(datetime.utcnow().date())
@@ -418,11 +416,11 @@ def build_masters(sync: bool):
         last_map = prices.ffill().iloc[-1].dropna().astype(float).to_dict()
 
     # Guardar en sesión
-    st.session_state["tx_master"]      = tx_df
-    st.session_state["settings_master"]= settings_df
-    st.session_state["prices_master"]  = prices if prices is not None else pd.DataFrame()
+    st.session_state["tx_master"]       = tx_df
+    st.session_state["settings_master"] = settings_df
+    st.session_state["prices_master"]   = prices if prices is not None else pd.DataFrame()
     st.session_state["bench_ret_master"]= bench_ret
-    st.session_state["last_map_master"]= last_map
+    st.session_state["last_map_master"] = last_map
     st.session_state["_masters_built_at"] = datetime.utcnow()
 
 # ================== ELIMINAR POR TICKER ==================
@@ -471,14 +469,20 @@ if page=="Mi Portafolio":
     # Precios y benchmark desde masters, slicing por ventana (sin IO)
     prices_master   = st.session_state["prices_master"]
     bench_ret_full  = st.session_state["bench_ret_master"]
+
     if start_date and prices_master is not None and not prices_master.empty:
         prices = prices_master.loc[pd.Timestamp(start_date):]
     else:
         prices = prices_master.copy()
 
+    # ---------- FIX: alinear benchmark por fechas sin KeyError ----------
     bench_ret = pd.Series(dtype=float)
     if bench_ret_full is not None and not bench_ret_full.empty:
-        bench_ret = bench_ret_full.loc[prices.index] if prices is not None and not prices.empty else bench_ret_full
+        if prices is not None and not prices.empty:
+            bench_ret = bench_ret_full.reindex(prices.index).ffill()  # <- cambio clave
+        else:
+            bench_ret = bench_ret_full
+    # -------------------------------------------------------------------
 
     # Últimos precios
     last_hint_map = dict(st.session_state.get("last_map_master", {}))
@@ -584,7 +588,7 @@ if page=="Mi Portafolio":
     else:
         st.info("Necesito al menos 2 días de histórico para calcular métricas.")
 
-# ================== OTRAS PESTAÑAS (se dejan sin cambios visuales) ==================
+# ================== OTRAS PESTAÑAS (sin cambios visuales) ==================
 elif page in ["Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Diagnóstico"]:
     st.title(page)
     st.info("Contenido no modificado. Esta sección mantiene el mismo formato de la app original.")
