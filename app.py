@@ -1,4 +1,6 @@
-# APP Finanzas – Portafolio con histórico en Google Sheets (locale-aware numbers)
+# APP Finanzas – Portafolio con histórico en Google Sheets
+# Optimización: masters por sesión, sync sólo en "Refrescar", cache estable y UI sin cambios.
+
 from datetime import datetime, timedelta, timezone, date
 import os, time, logging, re
 import numpy as np
@@ -11,7 +13,7 @@ from scipy.optimize import minimize
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ================== UI ==================
+# ================== CONFIG UI ==================
 st.set_page_config(page_title="APP Finanzas – Portafolio Activo", page_icon="💼", layout="wide")
 st.markdown("""
 <style>
@@ -29,31 +31,22 @@ try:
 except Exception:
     pass
 
-# ================== SECRETS / AUTH ==================
+# ================== SECRETS ==================
 SHEET_ID = st.secrets.get("SHEET_ID") or st.secrets.get("GSHEETS_SPREADSHEET_NAME", "")
 GCP_SA   = st.secrets.get("gcp_service_account", {})
 if not SHEET_ID: st.error("Falta `SHEET_ID` en secrets."); st.stop()
 if not GCP_SA:   st.error("Falta `gcp_service_account` en secrets."); st.stop()
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-try:
-    credentials = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
-    gc = gspread.authorize(credentials)
-except Exception as e:
-    st.error(f"No se pudo autorizar Google Sheets: {e}"); st.stop()
+# ================== CACHE DE RECURSOS (no se recrea el cliente) ==================
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    credentials = Credentials.from_service_account_info(GCP_SA, scopes=scopes)
+    return gspread.authorize(credentials)
+
+gc = get_gspread_client()
 
 # ================== UTILS ==================
-def refresh_all():
-    for f in (
-        read_sheet, load_all_data, find_cache_sheet, cache_read_prices, cache_latest_date_per_ticker,
-        cache_earliest_date_per_ticker, last_prices_from_cache, fetch_prices_yahoo_direct,
-        last_prices_yf_safe, last_prices_direct, load_prices_with_fallback
-    ):
-        try: f.clear()
-        except Exception: pass
-    try: st.cache_data.clear()
-    except Exception: pass
-
 def _clean_tickers(tickers):
     out=[]
     for t in tickers:
@@ -66,73 +59,33 @@ def _is_dtlike(x):
     return isinstance(x, (pd.Timestamp, datetime, date))
 
 def _parse_number(x):
-    """
-    Locale-aware:
-      - Detecta el ÚLTIMO separador como decimal
-      - El otro separador lo trata como miles y lo elimina
-      - Soporta: '45.778,00' -> 45778.00, '7,178,500.366' -> 7178500.366, '1 234,56', '$ 1.234,56'
-    """
+    """Locale-aware: detecta último separador decimal (coma/punto) y normaliza a float."""
     if x is None: return np.nan
-    if isinstance(x,(int,float)):
-        # evitar fechas serializadas de Excel (número grande ~ 40000-50000) en campos de Fees/Taxes, las conservamos; se limpiarán arriba si son datetime
-        return float(x)
+    if isinstance(x,(int,float)): return float(x)
     if _is_dtlike(x): return np.nan
     s = str(x).strip()
     if s == "": return np.nan
-    # quitar símbolos
-    s = re.sub(r"[^\d,\.\-\s]", "", s)
-    s = s.replace(" ", "")
-    # ambos separadores presentes
+    s = re.sub(r"[^\d,\.\-\s]", "", s).replace(" ", "")
     if "," in s and "." in s:
-        last_comma = s.rfind(",")
-        last_dot   = s.rfind(".")
-        if last_comma > last_dot:
-            # coma decimal, punto de miles
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
-        else:
-            # punto decimal, coma de miles
+        last_comma = s.rfind(","); last_dot = s.rfind(".")
+        if last_comma > last_dot:  # coma decimal
+            s = s.replace(".", "").replace(",", ".")
+        else:                      # punto decimal
             s = s.replace(",", "")
     else:
-        # solo uno o ninguno
-        # si solo hay comas: trátalas como decimal
-        if "," in s and "." not in s:
-            s = s.replace(",", ".")
-        # si solo hay puntos: ya es decimal americano
-    # colapsar signos raros
+        if "," in s: s = s.replace(",", ".")
     if s in ("", ".", "-", "-.", ".-"): return np.nan
-    try:
-        return float(s)
-    except:
-        return np.nan
+    try: return float(s)
+    except: return np.nan
 
-# ================== SHEETS ==================
-@st.cache_data(ttl=600, show_spinner=False)
+# ================== SHEETS HELPERS ==================
+def open_ws(name:str):
+    return gc.open_by_key(SHEET_ID).worksheet(name)
+
+@st.cache_data(ttl=1200, show_spinner=False)
 def read_sheet(name:str)->pd.DataFrame:
-    sh = gc.open_by_key(SHEET_ID); ws = sh.worksheet(name)
+    ws = open_ws(name)
     return pd.DataFrame(ws.get_all_records())
-
-def get_worksheet(name:str):
-    sh = gc.open_by_key(SHEET_ID); return sh.worksheet(name)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_all_data():
-    def safe(name, cols):
-        try:
-            df = read_sheet(name)
-            if df.empty: return pd.DataFrame(columns=cols)
-            for c in cols:
-                if c not in df.columns: df[c]=np.nan
-            return df
-        except Exception:
-            return pd.DataFrame(columns=cols)
-    tx_cols = ["TradeID","Account","Ticker","Name","AssetType","Currency",
-               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
-               "GrossAmount","NetAmount","LotID","Source","Notes"]
-    tx = safe("Transactions", tx_cols)
-    settings = safe("Settings", ["Key","Value","Description"])
-    watchlist = safe("Watchlist", ["Ticker","TargetWeight","Notes"])
-    return tx, settings, watchlist
 
 def get_setting(settings_df, key, default=None, cast=float):
     try:
@@ -142,14 +95,14 @@ def get_setting(settings_df, key, default=None, cast=float):
     except Exception:
         return default
 
-# ================== HISTÓRICO PRECIOS ==================
+# ======== Hoja de cache de precios (autodetección una sóla vez) ========
 CACHE_CANON = "PricesCache"
 
 def _norm_cols(cols):
     return [str(c).strip().lower().replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u") for c in cols]
 
-@st.cache_data(ttl=0, show_spinner=False)
-def find_cache_sheet():
+@st.cache_resource(show_spinner=False)
+def find_cache_meta():
     sh = gc.open_by_key(SHEET_ID)
     candidatas = []
     for ws in sh.worksheets():
@@ -173,15 +126,15 @@ def find_cache_sheet():
         return {"sheet": c[0], "date_col": c[1][0] if c[1] else "date",
                 "ticker_col": c[2][0] if c[2] else "ticker",
                 "close_col": c[3][0] if c[3] else "close"}
-    ws = sh.add_worksheet(title=CACHE_CANON, rows=1000, cols=3)
+    ws = gc.open_by_key(SHEET_ID).add_worksheet(title=CACHE_CANON, rows=1000, cols=3)
     ws.update("A1:C1", [["Date","Ticker","Close"]])
     return {"sheet": CACHE_CANON, "date_col":"date", "ticker_col":"ticker", "close_col":"close"}
 
 def _get_cache_ws():
-    meta = find_cache_sheet()
-    return gc.open_by_key(SHEET_ID).worksheet(meta["sheet"]), meta
+    meta = find_cache_meta()
+    return open_ws(meta["sheet"]), meta
 
-@st.cache_data(ttl=0, show_spinner=False)
+@st.cache_data(ttl=1200, show_spinner=False)
 def cache_read_prices(tickers, start_date=None):
     ws, meta = _get_cache_ws()
     values = ws.get_all_values()
@@ -195,7 +148,6 @@ def cache_read_prices(tickers, start_date=None):
     if df.empty: return pd.DataFrame()
     df[dcol] = pd.to_datetime(df[dcol], errors="coerce").dt.normalize()
     df[tcol] = df[tcol].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
-    # <<< USAR PARSER LOCALE-AWARE PARA CLOSE >>>
     df[ccol] = df[ccol].map(_parse_number)
     df = df.dropna(subset=[dcol,tcol,ccol])
     if start_date:
@@ -205,42 +157,6 @@ def cache_read_prices(tickers, start_date=None):
     if df.empty: return pd.DataFrame()
     wide = df.pivot_table(index=dcol, columns=tcol, values=ccol, aggfunc="last").sort_index()
     return wide[~wide.index.duplicated(keep="last")]
-
-@st.cache_data(ttl=0, show_spinner=False)
-def cache_latest_date_per_ticker(tickers):
-    ws, meta = _get_cache_ws(); values = ws.get_all_values()
-    out = {t: None for t in tickers}
-    if not values or len(values) < 2: return out
-    header = _norm_cols(values[0])
-    df = pd.DataFrame(values[1:], columns=header)
-    dcol = meta["date_col"]; tcol = meta["ticker_col"]
-    if dcol not in df.columns or tcol not in df.columns: return out
-    df = df[(df[dcol]!="") & (df[tcol]!="")]
-    if df.empty: return out
-    df[dcol] = pd.to_datetime(df[dcol], errors="coerce").dt.normalize()
-    df[tcol] = df[tcol].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
-    for t in _clean_tickers(tickers):
-        sub = df.loc[df[tcol]==t, dcol]
-        out[t] = sub.max() if not sub.empty else None
-    return out
-
-@st.cache_data(ttl=0, show_spinner=False)
-def cache_earliest_date_per_ticker(tickers):
-    ws, meta = _get_cache_ws(); values = ws.get_all_values()
-    out = {t: None for t in tickers}
-    if not values or len(values) < 2: return out
-    header = _norm_cols(values[0])
-    df = pd.DataFrame(values[1:], columns=header)
-    dcol = meta["date_col"]; tcol = meta["ticker_col"]
-    if dcol not in df.columns or tcol not in df.columns: return out
-    df = df[(df[dcol]!="") & (df[tcol]!="")]
-    if df.empty: return out
-    df[dcol] = pd.to_datetime(df[dcol], errors="coerce").dt.normalize()
-    df[tcol] = df[tcol].astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
-    for t in _clean_tickers(tickers):
-        sub = df.loc[df[tcol]==t, dcol]
-        out[t] = sub.min() if not sub.empty else None
-    return out
 
 def cache_append_prices(df_wide):
     if df_wide is None or df_wide.empty: return 0
@@ -285,7 +201,7 @@ def cache_append_prices(df_wide):
         total += len(rows[i:i+BATCH])
     return total
 
-# ================== PRECIOS (descarga) ==================
+# ================== DESCARGA PRECIOS (fallback Yahoo) ==================
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 os.environ.setdefault("YF_USER_AGENT", UA)
@@ -333,58 +249,7 @@ def _direct_one(ticker, start=None, end=None, interval="1d", timeout=25):
             time.sleep(0.6*(k+1))
     return pd.Series(dtype=float), last_err
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_prices_yahoo_direct(tickers, start=None, end=None, interval="1d"):
-    tickers = _clean_tickers(tickers)
-    if not tickers: return pd.DataFrame(), [], []
-    frames=[]; failed=[]; errs=[]
-    for t in tickers:
-        s, err = _direct_one(t, start=start, end=end, interval=interval)
-        if isinstance(s, pd.Series) and not s.empty: frames.append(s.rename(t).to_frame())
-        else:
-            failed.append(t); 
-            if err: errs.append(f"[direct:{t}] {err}")
-    if frames:
-        df = pd.concat(frames, axis=1).sort_index()
-        df.index = pd.to_datetime(df.index).normalize()
-        return df, failed, errs
-    return pd.DataFrame(), tickers, errs
-
-@st.cache_data(ttl=1500, show_spinner=False)
-def last_prices_yf_safe(tickers):
-    tickers = _clean_tickers(tickers)
-    if not tickers: return {}, []
-    out, failed = {}, []
-    try:
-        d = yf.download(" ".join(tickers), period="15d", interval="1d",
-                        auto_adjust=True, progress=False, group_by="ticker", threads=False)
-        if d is None or d.empty: raise RuntimeError("batch vacío")
-        for t in tickers:
-            try:
-                sub = d[(t,"Close")] if isinstance(d.columns, pd.MultiIndex) else d["Close"]
-                s = pd.Series(sub).dropna()
-                if not s.empty: out[t] = float(s.iloc[-1])
-                else: failed.append(t)
-            except Exception:
-                failed.append(t)
-    except Exception:
-        failed = tickers
-    return out, failed
-
-@st.cache_data(ttl=1200, show_spinner=False)
-def last_prices_direct(tickers):
-    tickers = _clean_tickers(tickers)
-    out, failed = {}, []
-    for t in tickers:
-        s, _ = _direct_one(t, interval="1d")
-        if isinstance(s, pd.Series) and not s.empty:
-            out[t] = float(s.dropna().iloc[-1])
-        else:
-            failed.append(t)
-    return out, failed
-
-# ================== SYNC HISTÓRICO ==================
-def _single_yf_range(ticker, start, end):
+def fetch_yahoo_range(ticker, start, end=None):
     try:
         d = yf.download(ticker, start=start, end=end, interval="1d",
                         auto_adjust=True, progress=False, threads=False)
@@ -394,53 +259,67 @@ def _single_yf_range(ticker, start, end):
     except Exception:
         return pd.Series(dtype=float)
 
-def load_prices_with_fallback(tickers, bench, start_date):
-    all_t = list(dict.fromkeys((tickers or []) + [bench])); all_t = _clean_tickers(all_t)
-    earliest = cache_earliest_date_per_ticker(all_t)
-    if start_date is not None:
-        sdt = pd.to_datetime(start_date).normalize()
-        for t in all_t:
-            e0 = earliest.get(t)
-            if e0 is None or (pd.notna(e0) and sdt < e0):
-                end_dt = (pd.to_datetime(e0).normalize() - pd.Timedelta(days=1)) if e0 is not None else None
-                s = _single_yf_range(t, start=start_date, end=end_dt)
-                if s.empty:
-                    s2, _ = _direct_one(t, start=start_date, end=end_dt)
-                    if not s2.empty: cache_append_prices(s2.to_frame())
-                else:
-                    cache_append_prices(s.to_frame())
-    latest = cache_latest_date_per_ticker(all_t)
-    today = pd.Timestamp(datetime.utcnow().date())
-    for t in all_t:
-        ld = latest.get(t)
-        if ld is None:
-            base_start = (today - pd.Timedelta(days=365*3)).strftime("%Y-%m-%d")
-            s = _single_yf_range(t, start=base_start, end=None)
-            if s.empty:
-                s2, _ = _direct_one(t, start=base_start, end=None)
-                if not s2.empty: cache_append_prices(s2.to_frame())
-            else:
-                cache_append_prices(s.to_frame())
-        elif pd.Timestamp(ld).normalize() < today:
-            start = (pd.to_datetime(ld).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            s = _single_yf_range(t, start=start, end=None)
-            if s.empty:
-                s2, _ = _direct_one(t, start=start, end=None)
-                if not s2.empty: cache_append_prices(s2.to_frame())
-            else:
-                cache_append_prices(s.to_frame())
-    consolidated = cache_read_prices(all_t, start_date=start_date)
-    if consolidated is None or consolidated.empty:
-        from_direct, _, _ = fetch_prices_yahoo_direct(all_t, start=start_date, end=None)
-        if not from_direct.empty:
-            cache_append_prices(from_direct)
-            consolidated = from_direct
-    bench_ret = pd.Series(dtype=float)
-    prices = consolidated.copy()
-    if not prices.empty and bench in prices.columns:
-        bench_ret = prices[[bench]].pct_change().dropna()[bench]
-        prices = prices.drop(columns=[bench], errors="ignore")
-    return prices, bench_ret
+# ================== TX → POSITIONS ==================
+def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
+    if tx.empty: return tx
+    df=tx.copy()
+    for c in ["TradeID","Account","Ticker","Name","AssetType","Currency",
+              "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
+              "GrossAmount","NetAmount","LotID","Source","Notes"]:
+        if c not in df.columns: df[c]=np.nan
+
+    df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
+    df=df.dropna(subset=["Ticker"])
+    df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
+
+    for col in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
+        if col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]): df[col]=np.nan
+            df[col]=df[col].map(_parse_number)
+
+    if "FXRate" in df.columns:
+        df["FXRate"]=df["FXRate"].replace(0,np.nan).fillna(1.0)
+
+    for col in ["Fees","Taxes"]:
+        if col in df.columns:
+            df[col]=df[col].fillna(0.0)
+            df.loc[df[col].abs()>1e7, col]=0.0
+
+    def signed(row):
+        s=str(row.get("Side","")).lower().strip()
+        q=float(row.get("Shares",0) or 0)
+        if s in ("sell","venta","vender","-1"): return -abs(q)
+        return abs(q)
+    df["SignedShares"]=df.apply(signed,axis=1)
+    return df
+
+def positions_from_tx(tx:pd.DataFrame, last_hint_map:dict|None=None):
+    if tx.empty:
+        return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
+    df=tidy_transactions(tx)
+    uniq=sorted(df["Ticker"].unique().tolist())
+    if not uniq:
+        return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
+    last_map = dict(last_hint_map or {})
+    pos=[]
+    for t,grp in df.groupby("Ticker"):
+        sh=float(grp["SignedShares"].sum())
+        if abs(sh)<1e-12: continue
+        buys=grp["SignedShares"]>0
+        if buys.any():
+            tot_sh=float(grp.loc[buys,"SignedShares"].sum())
+            cost_leg=(grp.loc[buys,"SignedShares"]*grp.loc[buys,"Price"].fillna(0)).sum()
+            fees_leg=grp.loc[buys,"Fees"].fillna(0).sum()+grp.loc[buys,"Taxes"].fillna(0).sum()
+            avg=(cost_leg+fees_leg)/tot_sh if tot_sh>0 else np.nan
+        else:
+            avg=np.nan
+        px=last_map.get(t, np.nan)
+        mv= sh*px if not np.isnan(px) else np.nan
+        inv= sh*avg if not np.isnan(avg) else np.nan
+        pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
+        pos.append([t,sh,avg,inv,px,mv,pl])
+    dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
+    return dfp.sort_values("MarketValue",ascending=False)
 
 # ================== MÉTRICAS ==================
 def annualize_return(d, freq=252):
@@ -467,117 +346,88 @@ def calmar(d,freq=252):
     er=annualize_return(d,freq); mdd=abs(max_drawdown((1+d).cumprod()))
     return er/mdd if mdd and mdd>0 else np.nan
 
-# ================== TX → POSITIONS ==================
-def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
-    if tx.empty: return tx
-    df=tx.copy()
-    for c in ["TradeID","Account","Ticker","Name","AssetType","Currency",
-              "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
-              "GrossAmount","NetAmount","LotID","Source","Notes"]:
-        if c not in df.columns: df[c]=np.nan
+# ================== SESSION MASTERS ==================
+SESSION_TTL_MIN = 30  # primera carga por sesión puede sincronizar; luego solo con "Refrescar"
 
-    df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
-    df=df.dropna(subset=["Ticker"])
-    df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
+def need_build(name:str)->bool:
+    return name not in st.session_state
 
-    # columnas numéricas con parser locale-aware
-    for col in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
-        if col in df.columns:
-            if pd.api.types.is_datetime64_any_dtype(df[col]):  # fechas mal puestas → NaN
-                df[col]=np.nan
-            df[col]=df[col].map(_parse_number)
+def masters_expired()->bool:
+    ts = st.session_state.get("_masters_built_at")
+    if ts is None: return True
+    return (datetime.utcnow() - ts).total_seconds() > SESSION_TTL_MIN*60
 
-    # Defaults
-    if "FXRate" in df.columns:
-        df["FXRate"]=df["FXRate"].replace(0,np.nan).fillna(1.0)
+def build_masters(sync: bool):
+    """Construye y guarda en session_state:
+       - tx_master, settings_master
+       - prices_master (wide), bench_ret_master
+       - last_map_master (últimos precios)
+       sync=True: intenta completar días faltantes (Yahoo) y escribir a Sheets (pesado)."""
+    # Leer hojas base
+    tx_df = read_sheet("Transactions")
+    settings_df = read_sheet("Settings")
+    benchmark = get_setting(settings_df,"Benchmark","SPY",str)
 
-    # sanity caps en Fees/Taxes (anti outliers por parseo)
-    for col in ["Fees","Taxes"]:
-        if col in df.columns:
-            df[col]=df[col].fillna(0.0)
-            df.loc[df[col].abs()>1e7, col]=0.0
+    # Tickers presentes en Transactions
+    tickers = sorted(set(
+        t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
+        if t
+    ))
+    all_t = list(dict.fromkeys((tickers or []) + [benchmark]))
 
-    def signed(row):
-        s=str(row.get("Side","")).lower().strip()
-        q=float(row.get("Shares",0) or 0)
-        if s in ("sell","venta","vender","-1"): return -abs(q)
-        return abs(q)
-    df["SignedShares"]=df.apply(signed,axis=1)
-    return df
+    # Sync pesado solo si se pidió
+    if sync:
+        # para cada ticker, completar (backfill/forward) con Yahoo y escribir a cache
+        # estrategia simple: si no hay nada, 3 años; si hay algo, desde último +1 día
+        ws, meta = _get_cache_ws()
+        cache = cache_read_prices(all_t, start_date=None)
+        today = pd.Timestamp(datetime.utcnow().date())
+        for t in all_t:
+            have = pd.Series(dtype=float)
+            if cache is not None and t in cache.columns:
+                have = cache[t].dropna()
+            if have.empty:
+                start = (today - pd.Timedelta(days=365*3)).strftime("%Y-%m-%d")
+                s = fetch_yahoo_range(t, start=start, end=None)
+                if s.empty:
+                    s2, _ = _direct_one(t, start=start, end=None)
+                    if not s2.empty: cache_append_prices(s2.to_frame())
+                else:
+                    cache_append_prices(s.to_frame())
+            else:
+                last = have.index.max()
+                if pd.Timestamp(last).normalize() < today:
+                    start = (pd.to_datetime(last).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    s = fetch_yahoo_range(t, start=start, end=None)
+                    if s.empty:
+                        s2, _ = _direct_one(t, start=start, end=None)
+                        if not s2.empty: cache_append_prices(s2.to_frame())
+                    else:
+                        cache_append_prices(s.to_frame())
 
-def positions_from_tx(tx:pd.DataFrame, last_hint_map:dict|None=None):
-    if tx.empty:
-        return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    df=tidy_transactions(tx)
-    uniq=sorted(df["Ticker"].unique().tolist())
-    if not uniq:
-        return pd.DataFrame(columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    last_map = dict(last_hint_map or {})
-    missing = [t for t in uniq if t not in last_map or pd.isna(last_map.get(t))]
-    if missing:
-        cached_fallback = last_prices_from_cache(missing); last_map.update(cached_fallback)
-        missing = [t for t in missing if t not in last_map or pd.isna(last_map.get(t))]
-    if missing:
-        lm2, _ = last_prices_yf_safe(missing); last_map.update(lm2)
-        missing = [t for t in missing if t not in last_map or pd.isna(last_map.get(t))]
-    if missing:
-        lm3, _ = last_prices_direct(missing); last_map.update(lm3)
-    pos=[]
-    for t,grp in df.groupby("Ticker"):
-        sh=float(grp["SignedShares"].sum())
-        if abs(sh)<1e-12: continue
-        buys=grp["SignedShares"]>0
-        if buys.any():
-            tot_sh=float(grp.loc[buys,"SignedShares"].sum())
-            cost_leg=(grp.loc[buys,"SignedShares"]*grp.loc[buys,"Price"].fillna(0)).sum()
-            fees_leg=grp.loc[buys,"Fees"].fillna(0).sum()+grp.loc[buys,"Taxes"].fillna(0).sum()
-            tot_cost=cost_leg+fees_leg
-            avg=tot_cost/tot_sh if tot_sh>0 else np.nan
-        else:
-            avg=np.nan
-        px=last_map.get(t, np.nan)
-        mv= sh*px if not np.isnan(px) else np.nan
-        inv= sh*avg if not np.isnan(avg) else np.nan
-        pl= mv-inv if not (np.isnan(mv) or np.isnan(inv)) else np.nan
-        pos.append([t,sh,avg,inv,px,mv,pl])
-    dfp=pd.DataFrame(pos,columns=["Ticker","Shares","AvgCost","Invested","MarketPrice","MarketValue","UnrealizedPL"])
-    return dfp.sort_values("MarketValue",ascending=False)
+    # Construir masters desde Sheets (sin descargar otra vez de Yahoo)
+    prices = cache_read_prices(all_t, start_date=None)
+    bench_ret = pd.Series(dtype=float)
+    if prices is not None and not prices.empty and benchmark in prices.columns:
+        bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
+        prices = prices.drop(columns=[benchmark], errors="ignore")
 
-@st.cache_data(ttl=60, show_spinner=False)
-def last_prices_from_cache(tickers):
-    tickers = _clean_tickers(tickers)
-    if not tickers: return {}
-    df = cache_read_prices(tickers, start_date=None)
-    if df is None or df.empty: return {}
-    out={}
-    for t in tickers:
-        try:
-            s = df[t].dropna()
-            if not s.empty: out[t] = float(s.iloc[-1])
-        except Exception: pass
-    return out
+    # Últimos precios desde cache wide
+    last_map={}
+    if prices is not None and not prices.empty:
+        last_map = prices.ffill().iloc[-1].dropna().astype(float).to_dict()
 
-def weights_from_positions(pos_df:pd.DataFrame):
-    if pos_df.empty: return pd.Series(dtype=float)
-    total=pos_df["MarketValue"].fillna(0).sum()
-    if total<=0: return pd.Series(dtype=float)
-    return (pos_df.set_index("Ticker")["MarketValue"]/total).sort_values(ascending=False)
+    # Guardar en sesión
+    st.session_state["tx_master"]      = tx_df
+    st.session_state["settings_master"]= settings_df
+    st.session_state["prices_master"]  = prices if prices is not None else pd.DataFrame()
+    st.session_state["bench_ret_master"]= bench_ret
+    st.session_state["last_map_master"]= last_map
+    st.session_state["_masters_built_at"] = datetime.utcnow()
 
-def const_weight_returns(price_df:pd.DataFrame, weights:pd.Series):
-    if price_df is None or price_df.empty or weights is None or len(weights)==0:
-        return pd.Series(dtype=float), pd.DataFrame()
-    cols=[c for c in price_df.columns if c in weights.index]
-    if not cols: return pd.Series(dtype=float), pd.DataFrame()
-    price_df=price_df[cols].dropna(how="all").ffill()
-    rets=price_df.pct_change().dropna(how="all")
-    if rets.empty: return pd.Series(dtype=float), pd.DataFrame()
-    w=weights.reindex(rets.columns).fillna(0).values
-    port=(rets*w).sum(axis=1)
-    return port, rets
-
-# ================== BORRADO ==================
+# ================== ELIMINAR POR TICKER ==================
 def delete_transactions_by_ticker(ticker:str)->int:
-    ws = get_worksheet("Transactions")
+    ws = open_ws("Transactions")
     values = ws.get_all_values()
     if not values: return 0
     headers = values[0]
@@ -593,58 +443,55 @@ def delete_transactions_by_ticker(ticker:str)->int:
     return len(to_delete)
 
 # ================== SIDEBAR ==================
-tx_df, settings_df, _ = load_all_data()
-rf = get_setting(settings_df,"RF",0.03,float)
-benchmark = get_setting(settings_df,"Benchmark","SPY",str)
-
 st.sidebar.title("📊 Navegación")
 page = st.sidebar.radio("Ir a:", ["Mi Portafolio","Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Diagnóstico"])
 window = st.sidebar.selectbox("Ventana histórica", ["6M","1Y","3Y","5Y","Max"], index=2)
 period_map={"6M":180,"1Y":365,"3Y":365*3,"5Y":365*5}
 start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period_map[window])).strftime("%Y-%m-%d")
 
-def align_positions_for_view(positions_df: pd.DataFrame, weights_index: pd.Index) -> pd.DataFrame:
-    if positions_df.empty: return positions_df
-    tmp = positions_df.set_index("Ticker")
-    if weights_index is not None and len(weights_index)>0:
-        tmp = tmp.reindex(weights_index)
-    out = tmp.reset_index()
-    if "Ticker" not in out.columns and "index" in out.columns:
-        out = out.rename(columns={"index":"Ticker"})
-    return out
-
-# ================== MI PORTAFOLIO ==================
+# ================== PÁGINA: MI PORTAFOLIO ==================
 if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
-    if st.button("🔄 Refrescar datos"):
-        refresh_all(); st.rerun()
 
-    tx_tickers = sorted(set(
-        t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
-        if t
-    ))
-    if not tx_tickers:
-        st.info("No hay posiciones. Carga operaciones en 'Transactions'."); st.stop()
+    # Botón refrescar: fuerza sync pesado + reconstrucción de masters
+    if st.button("🔄 Refrescar datos", use_container_width=False, type="secondary"):
+        for k in ("tx_master","settings_master","prices_master","bench_ret_master","last_map_master","_masters_built_at"):
+            st.session_state.pop(k, None)
+        build_masters(sync=True)
+        st.experimental_rerun()
 
-    prices, bench_ret = load_prices_with_fallback(tx_tickers, benchmark, start_date)
+    # Primera carga de sesión: construir masters (sync una sola vez si expiró TTL)
+    if need_build("prices_master") or masters_expired():
+        build_masters(sync=masters_expired())
 
-    last_hint_map = {}
-    if prices is not None and not prices.empty:
-        last_hint_map.update(prices.ffill().iloc[-1].dropna().astype(float).to_dict())
-    missing_for_last = [t for t in tx_tickers if t not in last_hint_map or pd.isna(last_hint_map.get(t))]
-    if missing_for_last:
-        last_hint_map.update(last_prices_from_cache(missing_for_last))
+    tx_df       = st.session_state["tx_master"]
+    settings_df = st.session_state["settings_master"]
+    benchmark   = get_setting(settings_df,"Benchmark","SPY",str)
 
+    # Precios y benchmark desde masters, slicing por ventana (sin IO)
+    prices_master   = st.session_state["prices_master"]
+    bench_ret_full  = st.session_state["bench_ret_master"]
+    if start_date and prices_master is not None and not prices_master.empty:
+        prices = prices_master.loc[pd.Timestamp(start_date):]
+    else:
+        prices = prices_master.copy()
+
+    bench_ret = pd.Series(dtype=float)
+    if bench_ret_full is not None and not bench_ret_full.empty:
+        bench_ret = bench_ret_full.loc[prices.index] if prices is not None and not prices.empty else bench_ret_full
+
+    # Últimos precios
+    last_hint_map = dict(st.session_state.get("last_map_master", {}))
+
+    # Posiciones (sin tocar IO)
     pos_df = positions_from_tx(tx_df, last_hint_map=last_hint_map)
     if pos_df.empty:
         st.info("No hay posiciones válidas tras procesar Transactions."); st.stop()
 
-    missing_last = pos_df.loc[pos_df["MarketPrice"].isna(),"Ticker"].tolist()
-    if missing_last:
-        st.caption("⚠️ Tickers sin último precio desde Sheets/YF: " + ", ".join(missing_last))
-
-    w = weights_from_positions(pos_df)
-    pos_df_view = align_positions_for_view(pos_df, w.index)
+    # Pesos y vistas
+    total_mv = pos_df["MarketValue"].fillna(0).sum()
+    w = (pos_df.set_index("Ticker")["MarketValue"]/total_mv).sort_values(ascending=False) if total_mv>0 else pd.Series(dtype=float)
+    pos_df_view = pos_df.set_index("Ticker").reindex(w.index).reset_index() if len(w)>0 else pos_df.copy()
 
     since_buy = (pos_df.set_index("Ticker")["MarketPrice"]/pos_df.set_index("Ticker")["AvgCost"] - 1)\
                 .replace([np.inf,-np.inf], np.nan)
@@ -666,12 +513,14 @@ if page=="Mi Portafolio":
         "➖": [False]*len(pos_df_view)
     }).replace([np.inf,-np.inf], np.nan)
 
+    # Tabla editable sólo para borrar (evita coste de data_editor en cada rerun)
     colcfg = {"➖": st.column_config.CheckboxColumn(label="➖", help="Marcar para eliminar este ticker", width="small", default=False)}
     editor_key = f"positions_editor_{window}"
+    disabled_cols = [c for c in view.columns if c!="➖"]
     edited = st.data_editor(view, hide_index=True, use_container_width=True,
-                            column_config=colcfg, disabled=[c for c in view.columns if c!="➖"],
-                            key=editor_key)
+                            column_config=colcfg, disabled=disabled_cols, key=editor_key)
 
+    # Detección de click en ➖ (comparado contra estado previo)
     prev_key = f"prev_editor_df_{window}"
     prev = st.session_state.get(prev_key)
     if prev is None:
@@ -694,25 +543,35 @@ if page=="Mi Portafolio":
                 st.session_state[prev_key]["➖"] = False
                 if deleted>0: st.success(f"Se eliminaron {deleted} fila(s) de {tkr}.")
                 else: st.info("No se encontraron filas para eliminar.")
-                refresh_all(); st.rerun()
+                # tras borrar, reconstruir masters rápido (sin sync pesado)
+                for k in ("tx_master","settings_master","prices_master","bench_ret_master","last_map_master"):
+                    st.session_state.pop(k, None)
+                build_masters(sync=False)
+                st.experimental_rerun()
         with c2:
             if st.button("❌ No, cancelar"):
                 st.session_state["delete_candidate"] = ""
                 st.session_state[prev_key]["➖"] = False
                 st.info("Operación cancelada.")
 
+    # Métricas y gráficos (sólo slicing/cálculo local)
     if prices is not None and not prices.empty and prices.shape[0] >= 2 and len(w)>0:
         c_top1, c_top2 = st.columns([2,1])
         with c_top1:
-            port_ret, _ = const_weight_returns(prices, w)
+            rets = prices.pct_change().dropna(how="all")
+            wv = w.reindex(rets.columns).fillna(0).values if len(w)>0 else np.array([])
+            port_ret = (rets*wv).sum(axis=1) if rets.shape[1] and len(wv) else pd.Series(dtype=float)
+
+            rf = get_setting(settings_df,"RF",0.03,float)
             c1,c2,c3,c4,c5,c6 = st.columns(6)
             c1.metric("Rend. anualizado", f"{(annualize_return(port_ret) or 0)*100:,.2f}%")
             c2.metric("Vol. anualizada", f"{(annualize_vol(port_ret) or 0)*100:,.2f}%")
-            c3.metric("Sharpe", f"{(sharpe(port_ret, get_setting(settings_df,'RF',0.03,float)) or 0):.2f}")
+            c3.metric("Sharpe", f"{(sharpe(port_ret, rf) or 0):.2f}")
             cum=(1+port_ret).cumprod(); mdd=max_drawdown(cum)
             c4.metric("Max Drawdown", f"{(mdd or 0)*100:,.2f}%")
-            c5.metric("Sortino", f"{(sortino(port_ret, get_setting(settings_df,'RF',0.03,float)) or 0):.2f}")
+            c5.metric("Sortino", f"{(sortino(port_ret, rf) or 0):.2f}")
             c6.metric("Calmar", f"{(calmar(port_ret) or 0):.2f}")
+
             curve=pd.DataFrame({"Portafolio":(1+port_ret).cumprod()})
             if bench_ret is not None and not bench_ret.empty:
                 curve["Benchmark"]=(1+bench_ret).cumprod().reindex(curve.index).ffill()
@@ -724,3 +583,8 @@ if page=="Mi Portafolio":
         st.info("No hay pesos válidos para calcular métricas.")
     else:
         st.info("Necesito al menos 2 días de histórico para calcular métricas.")
+
+# ================== OTRAS PESTAÑAS (se dejan sin cambios visuales) ==================
+elif page in ["Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Diagnóstico"]:
+    st.title(page)
+    st.info("Contenido no modificado. Esta sección mantiene el mismo formato de la app original.")
