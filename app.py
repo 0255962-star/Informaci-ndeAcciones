@@ -1,5 +1,5 @@
 # APP Finanzas – Portafolio con histórico en Google Sheets
-# Optimización + "Evaluar Candidato": buscador, perfil, gráfico vs SPY y simulador de impacto.
+# Descarga bajo demanda y persistente para tickers nuevos (PricesCache)
 
 from datetime import datetime, timedelta, timezone, date
 import os, time, logging, re
@@ -57,12 +57,20 @@ def get_gspread_client():
 gc = get_gspread_client()
 
 # ================== UTILS ==================
+def normalize_symbol(t: str) -> str:
+    """Normaliza símbolos problemáticos para Yahoo (BRK.B→BRK-B, BF.B→BF-B) y limpia espacios."""
+    if not isinstance(t, str): return ""
+    s = t.upper().strip().replace(" ", "")
+    # Mapas comunes
+    s = s.replace("BRK.B", "BRK-B").replace("BF.B","BF-B")
+    s = s.replace("/", "-")  # algunos feeds usan "/" para clases
+    return s
+
 def _clean_tickers(tickers):
     out=[]
     for t in tickers:
-        if not isinstance(t,str): continue
-        t=t.upper().strip().replace(" ","")
-        if t and t not in out: out.append(t)
+        s = normalize_symbol(t)
+        if s and s not in out: out.append(s)
     return out
 
 def _is_dtlike(x):
@@ -261,6 +269,71 @@ def fetch_yahoo_range(ticker, start, end=None):
     except Exception:
         return pd.Series(dtype=float)
 
+# ========= NUEVO: DESCARGA BAJO DEMANDA Y PERSISTENTE =========
+def ensure_prices(tickers, start: str, persist: bool = True) -> pd.DataFrame:
+    """
+    Garantiza que 'tickers' tengan histórico desde 'start' en PricesCache.
+    Devuelve un DataFrame wide con los tickers solicitados (de cache + lo que se haya escrito).
+    """
+    tlist = _clean_tickers(tickers)
+    # 1) Intento leer del cache
+    cached = cache_read_prices(tlist, start)
+    need = [t for t in tlist if (cached.empty or t not in cached.columns or cached[t].dropna().empty)]
+    if not need:
+        return cached.sort_index()
+
+    # 2) Descarga faltantes
+    new_cols = []
+    for t in need:
+        s = fetch_yahoo_range(t, start=start, end=None)
+        if s is None or s.empty:
+            s2, err = _direct_one(t, start=start, end=None)
+            if s2 is None or s2.empty:
+                st.warning(f"No pude obtener datos de {t} (Yahoo): {err or 'sin datos'}.")
+                continue
+            s = s2
+        if s is not None and not s.empty:
+            new_cols.append(s)
+
+    if new_cols:
+        # 3) Persistir a PricesCache
+        df_new = pd.concat(new_cols, axis=1).sort_index()
+        if persist:
+            try:
+                cache_append_prices(df_new)
+            except Exception as e:
+                st.warning(f"Se descargó pero no se pudo escribir en PricesCache: {e}")
+        # 4) Reconstruir masters ligeros (sin sync) para que todo lo nuevo esté disponible
+        for k in ("prices_master","bench_ret_master","last_map_master"):
+            st.session_state.pop(k, None)
+        _rebuild_prices_masters_light()
+
+    # 5) Volver a leer ya con lo nuevo
+    final = cache_read_prices(tlist, start)
+    return final.sort_index()
+
+def _rebuild_prices_masters_light():
+    """Reconstruye en sesión los masters que dependen de PricesCache sin tocar Transactions ni Settings."""
+    settings_df = st.session_state.get("settings_master") or read_sheet("Settings")
+    benchmark = get_setting(settings_df,"Benchmark","SPY",str)
+    tx_df = st.session_state.get("tx_master") or read_sheet("Transactions")
+    tickers = sorted(set(
+        t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
+        if t
+    ))
+    all_t = list(dict.fromkeys((tickers or []) + [benchmark]))
+    prices = cache_read_prices(all_t, start_date=None)
+    bench_ret = pd.Series(dtype=float)
+    if prices is not None and not prices.empty and benchmark in prices.columns:
+        bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
+        prices = prices.drop(columns=[benchmark], errors="ignore")
+    last_map={}
+    if prices is not None and not prices.empty:
+        last_map = prices.ffill().iloc[-1].dropna().astype(float).to_dict()
+    st.session_state["prices_master"]   = prices if prices is not None else pd.DataFrame()
+    st.session_state["bench_ret_master"]= bench_ret
+    st.session_state["last_map_master"] = last_map
+
 # ================== TX → POSITIONS ==================
 def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
     if tx.empty: return tx
@@ -269,7 +342,7 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
               "GrossAmount","NetAmount","LotID","Source","Notes"]:
         if c not in df.columns: df[c]=np.nan
-    df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
+    df["Ticker"]=df["Ticker"].astype(str).apply(normalize_symbol)
     df=df.dropna(subset=["Ticker"])
     df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
     for col in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
@@ -358,12 +431,11 @@ def build_masters(sync: bool):
     settings_df = read_sheet("Settings")
     benchmark = get_setting(settings_df,"Benchmark","SPY",str)
     tickers = sorted(set(
-        t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
+        t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).apply(normalize_symbol)
         if t
     ))
     all_t = list(dict.fromkeys((tickers or []) + [benchmark]))
     if sync:
-        ws, meta = _get_cache_ws()
         cache = cache_read_prices(all_t, start_date=None)
         today = pd.Timestamp(datetime.utcnow().date())
         for t in all_t:
@@ -415,7 +487,7 @@ def delete_transactions_by_ticker(ticker:str)->int:
         st.error("No encontré la columna 'Ticker' en Transactions."); return 0
     to_delete = []
     for i, row in enumerate(values[1:], start=2):
-        if len(row)>tcol and str(row[tcol]).strip().upper()==ticker.strip().upper():
+        if len(row)>tcol and normalize_symbol(row[tcol])==normalize_symbol(ticker):
             to_delete.append(i)
     for ridx in reversed(to_delete): ws.delete_rows(ridx)
     return len(to_delete)
@@ -558,22 +630,20 @@ if page=="Mi Portafolio":
 elif page=="Evaluar Candidato":
     st.title("🔎 Evaluar Candidato")
 
-    # Masters listos
     if need_build("prices_master") or masters_expired():
         build_masters(sync=False)
 
-    settings_df = st.session_state["settings_master"]
+    settings_df   = st.session_state["settings_master"]
     prices_master = st.session_state["prices_master"]
-    bench_ret_full = st.session_state["bench_ret_master"]
-    benchmark = get_setting(settings_df,"Benchmark","SPY",str)
+    bench_ret_full= st.session_state["bench_ret_master"]
+    benchmark     = get_setting(settings_df,"Benchmark","SPY",str)
 
-    # ---- helpers candidatos ----
+    # ---- helpers info empresa ----
     @st.cache_data(ttl=1800, show_spinner=False)
     def get_company_info(ticker:str):
         t = yf.Ticker(ticker)
         info = {}
         try:
-            # get_info puede variar; probamos fast_info y luego info
             fi = getattr(t, "fast_info", {}) or {}
             info.update({k: fi.get(k) for k in ["last_price","market_cap","beta"] if k in fi})
         except Exception:
@@ -596,29 +666,10 @@ elif page=="Evaluar Candidato":
             pass
         return info or {}
 
-    def get_series_from_cache_or_yahoo(tickers, start):
-        tickers = _clean_tickers(tickers)
-        df = cache_read_prices(tickers, start)
-        missing = [t for t in tickers if (df.empty or t not in df.columns)]
-        if missing:
-            for t in missing:
-                s = fetch_yahoo_range(t, start=start, end=None)
-                if s is None or s.empty:
-                    s2, _ = _direct_one(t, start=start, end=None)
-                    if not s2.empty:
-                        df = (df if not df.empty else pd.DataFrame(index=s2.index))
-                        df[t] = s2
-                else:
-                    df = (df if not df.empty else pd.DataFrame(index=s.index))
-                    df[t] = s
-        if not df.empty:
-            df = df.sort_index()
-        return df
-
-    # ---- UI de búsqueda ----
+    # ---- UI ----
     c1, c2 = st.columns([2,1])
     with c1:
-        user_query = st.text_input("Ticker del candidato (ej. NVDA, KO, COST):", value="", placeholder="Escribe un ticker")
+        user_query = st.text_input("Ticker del candidato (ej. NVDA, KO, COST, BRK.B):", value="", placeholder="Escribe un ticker")
     with c2:
         weight_new = st.slider("Peso a simular", min_value=0.0, max_value=0.3, value=0.05, step=0.01, help="Peso del candidato en el portafolio hipotético")
 
@@ -626,17 +677,22 @@ elif page=="Evaluar Candidato":
         st.info("Ingresa un **ticker** para evaluar el candidato.")
         st.stop()
 
-    cand = user_query.upper().strip()
+    cand = normalize_symbol(user_query)
     if not re.match(r"^[A-Z0-9\.\-]+$", cand):
-        st.error("Ticker inválido.")
+        st.error("Ticker inválido."); st.stop()
+
+    # ---- asegura que haya series (descarga y persiste si faltan) ----
+    start_for_chart = start_date or (datetime.utcnow()-timedelta(days=365*3)).strftime("%Y-%m-%d")
+    pxdf = ensure_prices([cand, benchmark], start_for_chart, persist=True)
+
+    if pxdf is None or pxdf.empty or cand not in pxdf.columns or benchmark not in pxdf.columns:
+        st.warning("No pude obtener suficientes datos para el candidato / SPY tras reintento.")
         st.stop()
 
     # ---- info de empresa ----
     info = get_company_info(cand)
     name = info.get("longName") or cand
     st.subheader(f"{name} ({cand})")
-
-    # Key stats
     ks1, ks2, ks3, ks4, ks5, ks6 = st.columns(6)
     ks1.metric("Precio", f"{info.get('last_price', np.nan):,.2f}" if info.get('last_price') else "—")
     ks2.metric("Cap. de mercado", f"{(info.get('market_cap') or 0):,}")
@@ -645,111 +701,66 @@ elif page=="Evaluar Candidato":
     ks5.metric("PE (fwd)", f"{info.get('forwardPE') or '—'}")
     dy = info.get("dividendYield")
     ks6.metric("Div. Yield", f"{(dy*100):.2f}%" if dy else "—")
-
     colA, colB = st.columns([2,1])
     with colB:
         st.markdown(f"**Sector:** {info.get('sector','—')}  \n**Industria:** {info.get('industry','—')}  \n**País:** {info.get('country','—')}")
-        if info.get("website"):
-            st.markdown(f"[Sitio web]({info.get('website')})")
+        if info.get("website"): st.markdown(f"[Sitio web]({info.get('website')})")
     with colA:
         desc = info.get("longBusinessSummary", "")
-        if desc:
-            st.write(desc[:800] + ("…" if len(desc)>800 else ""))
+        if desc: st.write(desc[:800] + ("…" if len(desc)>800 else ""))
 
-    # ---- Gráfico vs SPY ----
-    start_for_chart = start_date or (datetime.utcnow()-timedelta(days=365*3)).strftime("%Y-%m-%d")
-    pxdf = get_series_from_cache_or_yahoo([cand, benchmark], start_for_chart)
-    if pxdf is None or pxdf.empty or cand not in pxdf.columns or benchmark not in pxdf.columns:
-        st.warning("No pude obtener precios suficientes para el candidato / SPY en la ventana seleccionada.")
-    else:
-        norm = pxdf.ffill()/pxdf.ffill().iloc[0]
-        fig = px.line(norm, title=f"Comportamiento normalizado: {cand} vs {benchmark}")
-        st.plotly_chart(fig, use_container_width=True)
+    # ---- gráfico comparativo ----
+    norm = pxdf.ffill()/pxdf.ffill().iloc[0]
+    st.plotly_chart(px.line(norm[[cand, benchmark]], title=f"Comportamiento normalizado: {cand} vs {benchmark}"),
+                    use_container_width=True)
 
-    # ---- Simulador de impacto en portafolio ----
+    # ---- simulador ----
     with st.expander("📈 ¿Cómo cambiaría el portafolio si agrego este activo?"):
-        # datos actuales
         tx_df       = st.session_state["tx_master"]
         prices_all  = st.session_state["prices_master"]
         bench_ret   = st.session_state["bench_ret_master"]
-
-        # returns del portafolio actual en ventana
+        # Asegurar ventana en precios_all también (por si se reconstruyó)
         if start_date and prices_all is not None and not prices_all.empty:
             prices = prices_all.loc[pd.Timestamp(start_date):]
         else:
             prices = prices_all.copy()
 
-        # pesos actuales
         last_map = st.session_state.get("last_map_master", {})
         pos_df = positions_from_tx(tx_df, last_hint_map=last_map)
         tot_mv = pos_df["MarketValue"].fillna(0).sum()
         w_now = (pos_df.set_index("Ticker")["MarketValue"]/tot_mv).dropna() if tot_mv>0 else pd.Series(dtype=float)
 
         if prices is None or prices.empty or len(w_now)==0 or prices.shape[0]<2:
-            st.info("No hay suficientes datos para simular (se requieren precios y pesos actuales).")
+            st.info("No hay suficientes datos para simular.")
         else:
-            # returns actuales
             rets = prices.pct_change().dropna(how="all")
             wv   = w_now.reindex(rets.columns).fillna(0).values
             port_ret_now = (rets*wv).sum(axis=1)
 
-            # returns del candidato
-            cand_px = get_series_from_cache_or_yahoo([cand], prices.index.min().strftime("%Y-%m-%d"))
-            if cand_px is None or cand_px.empty or cand not in cand_px.columns:
-                st.warning("No pude obtener el histórico del candidato para esta ventana.")
-            else:
-                cand_px = cand_px.reindex(prices.index).ffill()
-                cand_ret = cand_px[cand].pct_change().dropna()
-                # alinear
-                idx = port_ret_now.index.intersection(cand_ret.index)
-                port_ret_now = port_ret_now.loc[idx]
-                cand_ret = cand_ret.loc[idx]
+            # returns del candidato (ya garantizados en pxdf)
+            cand_ret = pxdf[[cand]].pct_change().dropna().reindex(port_ret_now.index).ffill()[cand]
+            w_new = weight_new
+            port_ret_new = port_ret_now*(1 - w_new) + cand_ret*w_new
 
-                # simular mezcla: reasigno pesos actuales proporcionalmente *(1 - w_new)* + cand*w_new
-                w_new = weight_new
-                port_ret_new = port_ret_now*(1 - w_new) + cand_ret*w_new
+            rf = get_setting(settings_df,"RF",0.03,float)
+            def mset(s):
+                return (annualize_return(s), annualize_vol(s), sharpe(s, rf),
+                        max_drawdown((1+s).cumprod()), sortino(s, rf), calmar(s))
+            r0,v0,sh0,dd0,so0,ca0 = mset(port_ret_now)
+            r1,v1,sh1,dd1,so1,ca1 = mset(port_ret_new)
+            dfm = pd.DataFrame({
+                "Métrica":["Rend. anualizado","Vol. anualizada","Sharpe","Max Drawdown","Sortino","Calmar"],
+                "Actual":[f"{(r0 or 0)*100:,.2f}%", f"{(v0 or 0)*100:,.2f}%", f"{(sh0 or 0):.2f}", f"{(dd0 or 0)*100:,.2f}%",
+                          f"{(so0 or 0):.2f}", f"{(ca0 or 0):.2f}"],
+                "Con candidato":[f"{(r1 or 0)*100:,.2f}%", f"{(v1 or 0)*100:,.2f}%", f"{(sh1 or 0):.2f}", f"{(dd1 or 0)*100:,.2f}%",
+                                 f"{(so1 or 0):.2f}", f"{(ca1 or 0):.2f}"],
+                "Δ":[f"{((r1 or 0)-(r0 or 0))*100:,.2f} pp", f"{((v1 or 0)-(v0 or 0))*100:,.2f} pp",
+                     f"{((sh1 or 0)-(sh0 or 0)):.2f}", f"{((dd1 or 0)-(dd0 or 0))*100:,.2f} pp",
+                     f"{((so1 or 0)-(so0 or 0)):.2f}", f"{((ca1 or 0)-(ca0 or 0)):.2f}"]
+            })
+            st.dataframe(dfm, use_container_width=True)
 
-                rf = get_setting(settings_df,"RF",0.03,float)
-                m_now = {
-                    "Return": annualize_return(port_ret_now),
-                    "Vol": annualize_vol(port_ret_now),
-                    "Sharpe": sharpe(port_ret_now, rf),
-                    "MaxDD": max_drawdown((1+port_ret_now).cumprod()),
-                    "Sortino": sortino(port_ret_now, rf),
-                    "Calmar": calmar(port_ret_now)
-                }
-                m_new = {
-                    "Return": annualize_return(port_ret_new),
-                    "Vol": annualize_vol(port_ret_new),
-                    "Sharpe": sharpe(port_ret_new, rf),
-                    "MaxDD": max_drawdown((1+port_ret_new).cumprod()),
-                    "Sortino": sortino(port_ret_new, rf),
-                    "Calmar": calmar(port_ret_new)
-                }
-                dfm = pd.DataFrame({
-                    "Métrica":["Rend. anualizado","Vol. anualizada","Sharpe","Max Drawdown","Sortino","Calmar"],
-                    "Actual":[f"{(m_now['Return'] or 0)*100:,.2f}%",
-                              f"{(m_now['Vol'] or 0)*100:,.2f}%",
-                              f"{(m_now['Sharpe'] or 0):.2f}",
-                              f"{(m_now['MaxDD'] or 0)*100:,.2f}%",
-                              f"{(m_now['Sortino'] or 0):.2f}",
-                              f"{(m_now['Calmar'] or 0):.2f}"],
-                    "Con candidato":[f"{(m_new['Return'] or 0)*100:,.2f}%",
-                                     f"{(m_new['Vol'] or 0)*100:,.2f}%",
-                                     f"{(m_new['Sharpe'] or 0):.2f}",
-                                     f"{(m_new['MaxDD'] or 0)*100:,.2f}%",
-                                     f"{(m_new['Sortino'] or 0):.2f}",
-                                     f"{(m_new['Calmar'] or 0):.2f}"],
-                    "Δ":[f"{((m_new['Return'] or 0)-(m_now['Return'] or 0))*100:,.2f} pp",
-                         f"{((m_new['Vol'] or 0)-(m_now['Vol'] or 0))*100:,.2f} pp",
-                         f"{((m_new['Sharpe'] or 0)-(m_now['Sharpe'] or 0)):.2f}",
-                         f"{((m_new['MaxDD'] or 0)-(m_now['MaxDD'] or 0))*100:,.2f} pp",
-                         f"{((m_new['Sortino'] or 0)-(m_now['Sortino'] or 0)):.2f}",
-                         f"{((m_new['Calmar'] or 0)-(m_now['Calmar'] or 0)):.2f}"]
-                })
-                st.dataframe(dfm, use_container_width=True)
-
-# ================== OTRAS PESTAÑAS (placeholders, sin cambios de formato) ==================
+# ================== OTRAS PESTAÑAS (placeholders) ==================
 elif page in ["Optimizar y Rebalancear","Explorar / Research","Diagnóstico"]:
     st.title(page)
     st.info("Contenido no modificado. Esta sección mantiene el mismo formato de la app original.")
