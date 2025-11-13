@@ -1,5 +1,5 @@
 # APP Finanzas – Portafolio con histórico en Google Sheets
-# Optimización: masters por sesión, sync sólo en "Refrescar", cache estable y UI sin cambios.
+# Optimización + "Evaluar Candidato": buscador, perfil, gráfico vs SPY y simulador de impacto.
 
 from datetime import datetime, timedelta, timezone, date
 import os, time, logging, re
@@ -33,7 +33,6 @@ except Exception:
 
 # ================== RERUN COMPATIBLE ==================
 def safe_rerun():
-    """Usa st.rerun() (nuevo) y cae a experimental_rerun si el entorno es viejo."""
     try:
         st.rerun()
     except Exception:
@@ -48,7 +47,7 @@ GCP_SA   = st.secrets.get("gcp_service_account", {})
 if not SHEET_ID: st.error("Falta `SHEET_ID` en secrets."); st.stop()
 if not GCP_SA:   st.error("Falta `gcp_service_account` en secrets."); st.stop()
 
-# ================== CACHE DE RECURSOS (no se recrea el cliente) ==================
+# ================== CACHE CLIENTE GSHEETS ==================
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
@@ -70,7 +69,6 @@ def _is_dtlike(x):
     return isinstance(x, (pd.Timestamp, datetime, date))
 
 def _parse_number(x):
-    """Locale-aware: detecta último separador decimal (coma/punto) y normaliza a float."""
     if x is None: return np.nan
     if isinstance(x,(int,float)): return float(x)
     if _is_dtlike(x): return np.nan
@@ -79,10 +77,8 @@ def _parse_number(x):
     s = re.sub(r"[^\d,\.\-\s]", "", s).replace(" ", "")
     if "," in s and "." in s:
         last_comma = s.rfind(","); last_dot = s.rfind(".")
-        if last_comma > last_dot:  # coma decimal
-            s = s.replace(".", "").replace(",", ".")
-        else:                      # punto decimal
-            s = s.replace(",", "")
+        if last_comma > last_dot:  s = s.replace(".", "").replace(",", ".")
+        else:                      s = s.replace(",", "")
     else:
         if "," in s: s = s.replace(",", ".")
     if s in ("", ".", "-", "-.", ".-"): return np.nan
@@ -108,7 +104,6 @@ def get_setting(settings_df, key, default=None, cast=float):
 
 # ======== Hoja de cache de precios (autodetección una sóla vez) ========
 CACHE_CANON = "PricesCache"
-
 def _norm_cols(cols):
     return [str(c).strip().lower().replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u") for c in cols]
 
@@ -174,7 +169,6 @@ def cache_append_prices(df_wide):
     ws, meta = _get_cache_ws()
     df_wide = df_wide.copy()
     df_wide.index = pd.to_datetime(df_wide.index).normalize()
-
     existing = cache_read_prices(list(df_wide.columns))
     to_write = df_wide.copy()
     if existing is not None and not existing.empty:
@@ -184,7 +178,6 @@ def cache_append_prices(df_wide):
             ~existing.reindex(merged.index).notna(), other=np.nan)
         to_write = mask_new.dropna(how="all")
     if to_write.empty: return 0
-
     header_real = ws.get_all_values()[0]
     header_norm = _norm_cols(header_real)
     idx = {c:i for i,c in enumerate(header_norm)}
@@ -195,7 +188,6 @@ def cache_append_prices(df_wide):
         header_norm = _norm_cols(header_real)
         idx = {c:i for i,c in enumerate(header_norm)}
         dcol, tcol, ccol = "date","ticker","close"
-
     rows=[]
     for dt_i, row in to_write.sort_index().iterrows():
         for t, val in row.items():
@@ -205,7 +197,6 @@ def cache_append_prices(df_wide):
             r[idx[tcol]] = str(t)
             r[idx[ccol]] = float(val)
             rows.append(r)
-
     BATCH=800; total=0
     for i in range(0, len(rows), BATCH):
         ws.append_rows(rows[i:i+BATCH], value_input_option="RAW")
@@ -278,24 +269,19 @@ def tidy_transactions(tx:pd.DataFrame)->pd.DataFrame:
               "TradeDate","Side","Shares","Price","Fees","Taxes","FXRate",
               "GrossAmount","NetAmount","LotID","Source","Notes"]:
         if c not in df.columns: df[c]=np.nan
-
     df["Ticker"]=df["Ticker"].astype(str).str.upper().str.strip().str.replace(" ","",regex=False)
     df=df.dropna(subset=["Ticker"])
     df["TradeDate"]=pd.to_datetime(df["TradeDate"],errors="coerce").dt.date
-
     for col in ["Shares","Price","Fees","Taxes","FXRate","GrossAmount","NetAmount"]:
         if col in df.columns:
             if pd.api.types.is_datetime64_any_dtype(df[col]): df[col]=np.nan
             df[col]=df[col].map(_parse_number)
-
     if "FXRate" in df.columns:
         df["FXRate"]=df["FXRate"].replace(0,np.nan).fillna(1.0)
-
     for col in ["Fees","Taxes"]:
         if col in df.columns:
             df[col]=df[col].fillna(0.0)
             df.loc[df[col].abs()>1e7, col]=0.0
-
     def signed(row):
         s=str(row.get("Side","")).lower().strip()
         q=float(row.get("Shares",0) or 0)
@@ -358,35 +344,24 @@ def calmar(d,freq=252):
     return er/mdd if mdd and mdd>0 else np.nan
 
 # ================== SESSION MASTERS ==================
-SESSION_TTL_MIN = 30  # primera carga por sesión puede sincronizar; luego solo con "Refrescar"
+SESSION_TTL_MIN = 30
 
 def need_build(name:str)->bool:
     return name not in st.session_state
-
 def masters_expired()->bool:
     ts = st.session_state.get("_masters_built_at")
     if ts is None: return True
     return (datetime.utcnow() - ts).total_seconds() > SESSION_TTL_MIN*60
 
 def build_masters(sync: bool):
-    """Construye y guarda en session_state:
-       - tx_master, settings_master
-       - prices_master (wide), bench_ret_master
-       - last_map_master (últimos precios)
-       sync=True: intenta completar días faltantes (Yahoo) y escribir a Sheets (pesado)."""
-    # Leer hojas base
     tx_df = read_sheet("Transactions")
     settings_df = read_sheet("Settings")
     benchmark = get_setting(settings_df,"Benchmark","SPY",str)
-
-    # Tickers presentes en Transactions
     tickers = sorted(set(
         t for t in tx_df.get("Ticker", pd.Series(dtype=str)).astype(str).str.upper().str.strip().str.replace(" ","", regex=False)
         if t
     ))
     all_t = list(dict.fromkeys((tickers or []) + [benchmark]))
-
-    # Sync pesado solo si se pidió
     if sync:
         ws, meta = _get_cache_ws()
         cache = cache_read_prices(all_t, start_date=None)
@@ -413,20 +388,14 @@ def build_masters(sync: bool):
                         if not s2.empty: cache_append_prices(s2.to_frame())
                     else:
                         cache_append_prices(s.to_frame())
-
-    # Construir masters desde Sheets (sin descargar otra vez de Yahoo)
     prices = cache_read_prices(all_t, start_date=None)
     bench_ret = pd.Series(dtype=float)
     if prices is not None and not prices.empty and benchmark in prices.columns:
         bench_ret = prices[[benchmark]].pct_change().dropna()[benchmark]
         prices = prices.drop(columns=[benchmark], errors="ignore")
-
-    # Últimos precios desde cache wide
     last_map={}
     if prices is not None and not prices.empty:
         last_map = prices.ffill().iloc[-1].dropna().astype(float).to_dict()
-
-    # Guardar en sesión
     st.session_state["tx_master"]       = tx_df
     st.session_state["settings_master"] = settings_df
     st.session_state["prices_master"]   = prices if prices is not None else pd.DataFrame()
@@ -462,14 +431,12 @@ start_date = None if window=="Max" else (datetime.utcnow()-timedelta(days=period
 if page=="Mi Portafolio":
     st.title("💼 Mi Portafolio")
 
-    # Botón refrescar: fuerza sync pesado + reconstrucción de masters
     if st.button("🔄 Refrescar datos", use_container_width=False, type="secondary"):
         for k in ("tx_master","settings_master","prices_master","bench_ret_master","last_map_master","_masters_built_at"):
             st.session_state.pop(k, None)
         build_masters(sync=True)
-        safe_rerun()  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        safe_rerun()
 
-    # Primera carga de sesión: construir masters (sync una sola vez si expiró TTL)
     if need_build("prices_master") or masters_expired():
         build_masters(sync=masters_expired())
 
@@ -477,10 +444,8 @@ if page=="Mi Portafolio":
     settings_df = st.session_state["settings_master"]
     benchmark   = get_setting(settings_df,"Benchmark","SPY",str)
 
-    # Precios y benchmark desde masters, slicing por ventana (sin IO)
     prices_master   = st.session_state["prices_master"]
     bench_ret_full  = st.session_state["bench_ret_master"]
-
     if start_date and prices_master is not None and not prices_master.empty:
         prices = prices_master.loc[pd.Timestamp(start_date):]
     else:
@@ -493,15 +458,11 @@ if page=="Mi Portafolio":
         else:
             bench_ret = bench_ret_full
 
-    # Últimos precios
     last_hint_map = dict(st.session_state.get("last_map_master", {}))
-
-    # Posiciones (sin tocar IO)
     pos_df = positions_from_tx(tx_df, last_hint_map=last_hint_map)
     if pos_df.empty:
         st.info("No hay posiciones válidas tras procesar Transactions."); st.stop()
 
-    # Pesos y vistas
     total_mv = pos_df["MarketValue"].fillna(0).sum()
     w = (pos_df.set_index("Ticker")["MarketValue"]/total_mv).sort_values(ascending=False) if total_mv>0 else pd.Series(dtype=float)
     pos_df_view = pos_df.set_index("Ticker").reindex(w.index).reset_index() if len(w)>0 else pos_df.copy()
@@ -526,14 +487,12 @@ if page=="Mi Portafolio":
         "➖": [False]*len(pos_df_view)
     }).replace([np.inf,-np.inf], np.nan)
 
-    # Tabla editable sólo para borrar (evita coste de data_editor en cada rerun)
     colcfg = {"➖": st.column_config.CheckboxColumn(label="➖", help="Marcar para eliminar este ticker", width="small", default=False)}
     editor_key = f"positions_editor_{window}"
     disabled_cols = [c for c in view.columns if c!="➖"]
     edited = st.data_editor(view, hide_index=True, use_container_width=True,
                             column_config=colcfg, disabled=disabled_cols, key=editor_key)
 
-    # Detección de click en ➖ (comparado contra estado previo)
     prev_key = f"prev_editor_df_{window}"
     prev = st.session_state.get(prev_key)
     if prev is None:
@@ -556,18 +515,16 @@ if page=="Mi Portafolio":
                 st.session_state[prev_key]["➖"] = False
                 if deleted>0: st.success(f"Se eliminaron {deleted} fila(s) de {tkr}.")
                 else: st.info("No se encontraron filas para eliminar.")
-                # tras borrar, reconstruir masters rápido (sin sync pesado)
                 for k in ("tx_master","settings_master","prices_master","bench_ret_master","last_map_master"):
                     st.session_state.pop(k, None)
                 build_masters(sync=False)
-                safe_rerun()  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                safe_rerun()
         with c2:
             if st.button("❌ No, cancelar"):
                 st.session_state["delete_candidate"] = ""
                 st.session_state[prev_key]["➖"] = False
                 st.info("Operación cancelada.")
 
-    # Métricas y gráficos (sólo slicing/cálculo local)
     if prices is not None and not prices.empty and prices.shape[0] >= 2 and len(w)>0:
         c_top1, c_top2 = st.columns([2,1])
         with c_top1:
@@ -597,8 +554,202 @@ if page=="Mi Portafolio":
     else:
         st.info("Necesito al menos 2 días de histórico para calcular métricas.")
 
-# ================== OTRAS PESTAÑAS (sin cambios visuales) ==================
-elif page in ["Optimizar y Rebalancear","Evaluar Candidato","Explorar / Research","Diagnóstico"]:
+# ================== PÁGINA: EVALUAR CANDIDATO ==================
+elif page=="Evaluar Candidato":
+    st.title("🔎 Evaluar Candidato")
+
+    # Masters listos
+    if need_build("prices_master") or masters_expired():
+        build_masters(sync=False)
+
+    settings_df = st.session_state["settings_master"]
+    prices_master = st.session_state["prices_master"]
+    bench_ret_full = st.session_state["bench_ret_master"]
+    benchmark = get_setting(settings_df,"Benchmark","SPY",str)
+
+    # ---- helpers candidatos ----
+    @st.cache_data(ttl=1800, show_spinner=False)
+    def get_company_info(ticker:str):
+        t = yf.Ticker(ticker)
+        info = {}
+        try:
+            # get_info puede variar; probamos fast_info y luego info
+            fi = getattr(t, "fast_info", {}) or {}
+            info.update({k: fi.get(k) for k in ["last_price","market_cap","beta"] if k in fi})
+        except Exception:
+            pass
+        try:
+            gi = t.get_info()
+            if gi:
+                info.update({
+                    "longName": gi.get("longName") or gi.get("shortName"),
+                    "sector": gi.get("sector"),
+                    "industry": gi.get("industry"),
+                    "website": gi.get("website"),
+                    "country": gi.get("country"),
+                    "longBusinessSummary": gi.get("longBusinessSummary"),
+                    "forwardPE": gi.get("forwardPE"),
+                    "trailingPE": gi.get("trailingPE"),
+                    "dividendYield": gi.get("dividendYield"),
+                })
+        except Exception:
+            pass
+        return info or {}
+
+    def get_series_from_cache_or_yahoo(tickers, start):
+        tickers = _clean_tickers(tickers)
+        df = cache_read_prices(tickers, start)
+        missing = [t for t in tickers if (df.empty or t not in df.columns)]
+        if missing:
+            for t in missing:
+                s = fetch_yahoo_range(t, start=start, end=None)
+                if s is None or s.empty:
+                    s2, _ = _direct_one(t, start=start, end=None)
+                    if not s2.empty:
+                        df = (df if not df.empty else pd.DataFrame(index=s2.index))
+                        df[t] = s2
+                else:
+                    df = (df if not df.empty else pd.DataFrame(index=s.index))
+                    df[t] = s
+        if not df.empty:
+            df = df.sort_index()
+        return df
+
+    # ---- UI de búsqueda ----
+    c1, c2 = st.columns([2,1])
+    with c1:
+        user_query = st.text_input("Ticker del candidato (ej. NVDA, KO, COST):", value="", placeholder="Escribe un ticker")
+    with c2:
+        weight_new = st.slider("Peso a simular", min_value=0.0, max_value=0.3, value=0.05, step=0.01, help="Peso del candidato en el portafolio hipotético")
+
+    if not user_query:
+        st.info("Ingresa un **ticker** para evaluar el candidato.")
+        st.stop()
+
+    cand = user_query.upper().strip()
+    if not re.match(r"^[A-Z0-9\.\-]+$", cand):
+        st.error("Ticker inválido.")
+        st.stop()
+
+    # ---- info de empresa ----
+    info = get_company_info(cand)
+    name = info.get("longName") or cand
+    st.subheader(f"{name} ({cand})")
+
+    # Key stats
+    ks1, ks2, ks3, ks4, ks5, ks6 = st.columns(6)
+    ks1.metric("Precio", f"{info.get('last_price', np.nan):,.2f}" if info.get('last_price') else "—")
+    ks2.metric("Cap. de mercado", f"{(info.get('market_cap') or 0):,}")
+    ks3.metric("Beta", f"{info.get('beta') or '—'}")
+    ks4.metric("PE (TTM)", f"{info.get('trailingPE') or '—'}")
+    ks5.metric("PE (fwd)", f"{info.get('forwardPE') or '—'}")
+    dy = info.get("dividendYield")
+    ks6.metric("Div. Yield", f"{(dy*100):.2f}%" if dy else "—")
+
+    colA, colB = st.columns([2,1])
+    with colB:
+        st.markdown(f"**Sector:** {info.get('sector','—')}  \n**Industria:** {info.get('industry','—')}  \n**País:** {info.get('country','—')}")
+        if info.get("website"):
+            st.markdown(f"[Sitio web]({info.get('website')})")
+    with colA:
+        desc = info.get("longBusinessSummary", "")
+        if desc:
+            st.write(desc[:800] + ("…" if len(desc)>800 else ""))
+
+    # ---- Gráfico vs SPY ----
+    start_for_chart = start_date or (datetime.utcnow()-timedelta(days=365*3)).strftime("%Y-%m-%d")
+    pxdf = get_series_from_cache_or_yahoo([cand, benchmark], start_for_chart)
+    if pxdf is None or pxdf.empty or cand not in pxdf.columns or benchmark not in pxdf.columns:
+        st.warning("No pude obtener precios suficientes para el candidato / SPY en la ventana seleccionada.")
+    else:
+        norm = pxdf.ffill()/pxdf.ffill().iloc[0]
+        fig = px.line(norm, title=f"Comportamiento normalizado: {cand} vs {benchmark}")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Simulador de impacto en portafolio ----
+    with st.expander("📈 ¿Cómo cambiaría el portafolio si agrego este activo?"):
+        # datos actuales
+        tx_df       = st.session_state["tx_master"]
+        prices_all  = st.session_state["prices_master"]
+        bench_ret   = st.session_state["bench_ret_master"]
+
+        # returns del portafolio actual en ventana
+        if start_date and prices_all is not None and not prices_all.empty:
+            prices = prices_all.loc[pd.Timestamp(start_date):]
+        else:
+            prices = prices_all.copy()
+
+        # pesos actuales
+        last_map = st.session_state.get("last_map_master", {})
+        pos_df = positions_from_tx(tx_df, last_hint_map=last_map)
+        tot_mv = pos_df["MarketValue"].fillna(0).sum()
+        w_now = (pos_df.set_index("Ticker")["MarketValue"]/tot_mv).dropna() if tot_mv>0 else pd.Series(dtype=float)
+
+        if prices is None or prices.empty or len(w_now)==0 or prices.shape[0]<2:
+            st.info("No hay suficientes datos para simular (se requieren precios y pesos actuales).")
+        else:
+            # returns actuales
+            rets = prices.pct_change().dropna(how="all")
+            wv   = w_now.reindex(rets.columns).fillna(0).values
+            port_ret_now = (rets*wv).sum(axis=1)
+
+            # returns del candidato
+            cand_px = get_series_from_cache_or_yahoo([cand], prices.index.min().strftime("%Y-%m-%d"))
+            if cand_px is None or cand_px.empty or cand not in cand_px.columns:
+                st.warning("No pude obtener el histórico del candidato para esta ventana.")
+            else:
+                cand_px = cand_px.reindex(prices.index).ffill()
+                cand_ret = cand_px[cand].pct_change().dropna()
+                # alinear
+                idx = port_ret_now.index.intersection(cand_ret.index)
+                port_ret_now = port_ret_now.loc[idx]
+                cand_ret = cand_ret.loc[idx]
+
+                # simular mezcla: reasigno pesos actuales proporcionalmente *(1 - w_new)* + cand*w_new
+                w_new = weight_new
+                port_ret_new = port_ret_now*(1 - w_new) + cand_ret*w_new
+
+                rf = get_setting(settings_df,"RF",0.03,float)
+                m_now = {
+                    "Return": annualize_return(port_ret_now),
+                    "Vol": annualize_vol(port_ret_now),
+                    "Sharpe": sharpe(port_ret_now, rf),
+                    "MaxDD": max_drawdown((1+port_ret_now).cumprod()),
+                    "Sortino": sortino(port_ret_now, rf),
+                    "Calmar": calmar(port_ret_now)
+                }
+                m_new = {
+                    "Return": annualize_return(port_ret_new),
+                    "Vol": annualize_vol(port_ret_new),
+                    "Sharpe": sharpe(port_ret_new, rf),
+                    "MaxDD": max_drawdown((1+port_ret_new).cumprod()),
+                    "Sortino": sortino(port_ret_new, rf),
+                    "Calmar": calmar(port_ret_new)
+                }
+                dfm = pd.DataFrame({
+                    "Métrica":["Rend. anualizado","Vol. anualizada","Sharpe","Max Drawdown","Sortino","Calmar"],
+                    "Actual":[f"{(m_now['Return'] or 0)*100:,.2f}%",
+                              f"{(m_now['Vol'] or 0)*100:,.2f}%",
+                              f"{(m_now['Sharpe'] or 0):.2f}",
+                              f"{(m_now['MaxDD'] or 0)*100:,.2f}%",
+                              f"{(m_now['Sortino'] or 0):.2f}",
+                              f"{(m_now['Calmar'] or 0):.2f}"],
+                    "Con candidato":[f"{(m_new['Return'] or 0)*100:,.2f}%",
+                                     f"{(m_new['Vol'] or 0)*100:,.2f}%",
+                                     f"{(m_new['Sharpe'] or 0):.2f}",
+                                     f"{(m_new['MaxDD'] or 0)*100:,.2f}%",
+                                     f"{(m_new['Sortino'] or 0):.2f}",
+                                     f"{(m_new['Calmar'] or 0):.2f}"],
+                    "Δ":[f"{((m_new['Return'] or 0)-(m_now['Return'] or 0))*100:,.2f} pp",
+                         f"{((m_new['Vol'] or 0)-(m_now['Vol'] or 0))*100:,.2f} pp",
+                         f"{((m_new['Sharpe'] or 0)-(m_now['Sharpe'] or 0)):.2f}",
+                         f"{((m_new['MaxDD'] or 0)-(m_now['MaxDD'] or 0))*100:,.2f} pp",
+                         f"{((m_new['Sortino'] or 0)-(m_now['Sortino'] or 0)):.2f}",
+                         f"{((m_new['Calmar'] or 0)-(m_now['Calmar'] or 0)):.2f}"]
+                })
+                st.dataframe(dfm, use_container_width=True)
+
+# ================== OTRAS PESTAÑAS (placeholders, sin cambios de formato) ==================
+elif page in ["Optimizar y Rebalancear","Explorar / Research","Diagnóstico"]:
     st.title(page)
     st.info("Contenido no modificado. Esta sección mantiene el mismo formato de la app original.")
-
